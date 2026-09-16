@@ -50,6 +50,8 @@ stamped 4 的库不必在新含义下重跑；Rust 侧不再读写它们。
 
 **`install-hub.sh` 从本仓库的 Release 取产物。** 上游里写死的是 `monitor-probe/monitor`，
 在分支上执行装下来的是上游的二进制，与这个仓库发布了什么无关；已改为 `liz963/monitor`。
+除此之外与上游逐字相同——安装路径、`/opt/monitor` 布局、systemd 单元、菜单、校验与回滚
+都没动，`install.sh` 更是一字未改。也就是**部署方式与上游完全一致，只有二进制来自本仓库**。
 仓库内其余指向 `monitor-probe` 的地方保持不动，它们指向的确实是上游项目。
 
 ### 不变
@@ -72,3 +74,16 @@ stamped 4 的库不必在新含义下重跑；Rust 侧不再读写它们。
 agent (Linux)  ──WebSocket / JSON-RPC 2.0──▶  hub (axum + SQLite)  ──▶  后台 + 状态页
 komari-agent   ──WebSocket / gzip POST ────▶  /api/clients/v2/rpc ──▶  同一条上报链路
 ```
+
+## 安装
+
+hub 装一台，agent 每台被监控的机器一个——两个脚本名字像，装的东西相反：
+
+| 脚本 | 装什么 | 用法 | 初始化系统 |
+|---|---|---|---|
+| `install-hub.sh` | 服务端 hub，取本仓库 Release | `sudo ./install-hub.sh`，有终端时给菜单 | 只支持 systemd |
+| `/install.sh` | 节点 agent，二进制由 hub 中继 | `curl -fsSL https://你的域名/install.sh \| sh -s -- --server 域名 --register KEY` | systemd 或 OpenRC（Alpine） |
+
+`install.sh` 是编译进 hub 的，挂在 `/install.sh` 路由上；它要装的 agent 二进制也由 hub 的
+`/agent/{arch}` 中继（hub 侧可配 GitHub 代理），所以节点只要能连上 hub 就能装，不必自己解析
+github.com。两者落在同一个 `/opt/monitor` 下——hub 的库和主题在 `data/`，卸载 hub 默认保留。
