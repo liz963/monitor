@@ -48,6 +48,14 @@ pub struct App {
     /// two have different threat models, and a batch install run with a stale
     /// key must not lock the operator out of the panel.
     pub registrations: auth::Throttle,
+    /// When each `(node, probe)` pair was last handed to a komari-agent, which
+    /// is how that protocol's cadence is kept. Keyed by the pair rather than by
+    /// node, because two probes on one node may run on different periods.
+    ///
+    /// Part of the running hub rather than a `static`, so it lives and dies with
+    /// the `App` that owns the sessions it describes. See `agent_ws::due_probes`
+    /// for why the cadence has to be kept at all.
+    pub ping_pushed: Mutex<HashMap<(i64, i64), std::time::Instant>>,
     pub http: reqwest::Client,
     /// Public base URL when `--site` was given, empty otherwise. In the default
     /// case the hub is reached at whatever ip:port the browser used and the
@@ -67,6 +75,7 @@ impl App {
             snapshot: Mutex::new([(0, Default::default()), (0, Default::default())]),
             throttle: auth::Throttle::default(),
             registrations: auth::Throttle::default(),
+            ping_pushed: Mutex::default(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
@@ -372,6 +381,9 @@ async fn main() -> Result<()> {
 
     tokio::spawn(housekeeping(app.clone()));
     notify::spawn_node_watcher(app.clone());
+    // A komari-agent measures a probe once per assignment, so the period between
+    // measurements is the hub's to keep; see `agent_ws::spawn_komari_probes`.
+    agent_ws::spawn_komari_probes(app.clone());
 
     let router = Router::new()
         // Agents.

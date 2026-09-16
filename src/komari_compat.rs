@@ -8,14 +8,38 @@
 
 use serde_json::{json, Value};
 
-/// Methods a komari-agent sends. Only the first two are acted on; the rest are
-/// logged and ignored, exactly as the plan intends (ping / exec results are a
-/// later iteration).
+use crate::db::Probe;
+
+/// Methods a komari-agent sends. The first three are acted on; the rest are
+/// logged and ignored, as the plan intends (exec, terminal and file results are
+/// a later iteration).
 pub const METHOD_REPORT: &str = "agent.report";
 pub const METHOD_BASIC_INFO: &str = "agent.basicInfo";
 pub const METHOD_PING_RESULT: &str = "agent.pingResult";
 pub const METHOD_TASK_RESULT: &str = "agent.taskResult";
 pub const METHOD_EVENT: &str = "agent.event";
+
+/// The method a komari-agent polls with. A v2 client on the POST fallback has no
+/// socket for the hub to push down, so its probe assignments are returned as
+/// events in the reply to this call.
+pub const METHOD_PULL: &str = "agent.pull";
+
+/// The method naming a probe assignment on the way out. komari has both a push
+/// form and a queue form for it; the hub uses the push form, and the queued form
+/// only for a node that is on the POST fallback and therefore has no socket to
+/// push down.
+pub const METHOD_PING: &str = "agent.ping";
+
+/// The probe type the hub asks for. A native agent TCP-connects to
+/// `host:port`, and `api::valid_target` admits nothing else -- no URL, no bare
+/// host -- and `tcpPing` on the komari side splits exactly the same string. So
+/// one value serves every probe, and a komari node's latency is measured the
+/// same way as a native node's and is comparable on the same chart.
+///
+/// komari also accepts `icmp` and `http`; neither can be expressed, because a
+/// probe here carries a target and nothing else. Widening this means giving
+/// `ping_task` a type column first.
+pub const PING_TYPE: &str = "tcp";
 
 /// The boot identity every komari report carries. A komari report has no boot
 /// id of its own (the server assigns a UUID on its side), and this hub's
@@ -150,9 +174,63 @@ pub fn convert_komari_basic_info(info: &Value) -> Value {
     })
 }
 
+/// The assignment itself, shared by the pushed and the queued form so the two
+/// cannot disagree on a field name.
+fn ping_params(probe: &Probe) -> Value {
+    json!({
+        "ping_task_id": probe.id,
+        "ping_type": PING_TYPE,
+        "ping_target": probe.target,
+    })
+}
+
+/// A probe assignment as komari's own server pushes it: a JSON-RPC notification
+/// with no `id`.
+///
+/// There is nothing to correlate -- the agent replies on whichever channel
+/// carried the assignment -- so an `id` would only invite the agent's event
+/// deduplication, which would then swallow every repeat after the first. The
+/// cadence is the hub's (komari sends no interval with the assignment), so the
+/// same probe is pushed once per period and each push must count.
+pub fn ping_event(probe: &Probe) -> Value {
+    json!({"jsonrpc": "2.0", "method": METHOD_PING, "params": ping_params(probe)})
+}
+
+/// The same assignment wrapped as a queued event for an `agent.pull` reply.
+///
+/// A node on the POST fallback has no socket to push down, so its assignments
+/// ride the reply to its own pull and carry an id: queued events are the one
+/// form komari's agent deduplicates, and a reply it never received would
+/// otherwise be indistinguishable from one already acted on.
+pub fn ping_event_queued(event_id: &str, probe: &Probe) -> Value {
+    json!({"id": event_id, "method": METHOD_PING, "params": ping_params(probe)})
+}
+
+/// The reading in an `agent.pingResult`: `(task_id, value)`.
+///
+/// `value` is milliseconds, and `-1` is how komari reports a probe that did not
+/// answer -- the same convention as the native pipeline, where any negative
+/// latency counts as a lost packet (`close_bucket`). A frame with no `value` is
+/// therefore not a reading of -1 and returns nothing, exactly as
+/// `agent_ws::dispatch` refuses to invent one for a missing `latency_ms`:
+/// defaulting here would render a malformed frame as an outage.
+///
+/// `task_id` is komari's `uint`; zero and negatives address no probe. The
+/// database drop a result whose probe is not assigned to that node, so an id
+/// that is merely unknown needs no check here.
+pub fn ping_result(params: &Value) -> Option<(i64, i64)> {
+    let task_id = pick(params, &["task_id"]).and_then(|v| v.as_i64()).filter(|id| *id > 0)?;
+    let value = pick(params, &["value"]).and_then(|v| v.as_i64())?;
+    Some((task_id, value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn probe() -> Probe {
+        Probe { id: 7, target: "1.1.1.1:443".into(), interval: 60 }
+    }
 
     fn report() -> Value {
         serde_json::from_str(
@@ -267,5 +345,42 @@ mod tests {
         assert!(!valid_komari_token("has spaces"));
         assert!(!valid_komari_token("has_underscore"));
         assert!(!valid_komari_token(&"x".repeat(200)));
+    }
+
+    /// The pushed and the queued form must address the same probe and carry the
+    /// same target; only the envelope differs, because only the queued one is
+    /// deduplicated by the agent.
+    #[test]
+    fn both_ping_forms_carry_the_same_assignment() {
+        let pushed = ping_event(&probe());
+        assert_eq!(pushed["jsonrpc"], "2.0");
+        assert_eq!(pushed["method"], METHOD_PING);
+        assert!(pushed.get("id").is_none(), "a pushed assignment counts every time, so it must stay id-less");
+
+        let queued = ping_event_queued("evt-1", &probe());
+        assert_eq!(queued["id"], "evt-1");
+        assert_eq!(queued["method"], METHOD_PING);
+        assert_eq!(pushed["params"], queued["params"], "one field name, one place to change it");
+
+        assert_eq!(pushed["params"]["ping_task_id"], 7);
+        assert_eq!(pushed["params"]["ping_type"], PING_TYPE);
+        assert_eq!(pushed["params"]["ping_target"], "1.1.1.1:443");
+    }
+
+    /// A frame with no `value` is not a reading, and -1 is: turning the first
+    /// into the second would draw an outage that never happened.
+    #[test]
+    fn a_ping_result_without_a_value_is_not_a_lost_packet() {
+        assert_eq!(ping_result(&json!({"task_id": 3, "value": 42})), Some((3, 42)));
+        assert_eq!(
+            ping_result(&json!({"task_id": 3, "value": -1})),
+            Some((3, -1)),
+            "-1 is komari's own lost packet, and the pipeline already counts it as one"
+        );
+        assert_eq!(ping_result(&json!({"task_id": 3})), None, "no reading is not a reading of -1");
+        assert_eq!(ping_result(&json!({"task_id": 3, "value": "fast"})), None);
+        assert_eq!(ping_result(&json!({"value": 42})), None, "a result with no task addresses nothing");
+        assert_eq!(ping_result(&json!({"task_id": 0, "value": 42})), None);
+        assert_eq!(ping_result(&json!({"task_id": -1, "value": 42})), None);
     }
 }

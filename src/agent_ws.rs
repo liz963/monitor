@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::auth::client_ip;
+use crate::db::Probe;
 use crate::komari_compat;
 use crate::{App, Shared};
 
@@ -218,10 +219,42 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 /// One JSON-RPC response for a komari POST request. The agent expects a
 /// standard JSON-RPC envelope on success; unknown methods also receive one, so
-/// a channel the hub does not act on (e.g. `agent.pull` during POST fallback)
-/// is not mistaken for a broken connection.
+/// a channel the hub does not act on is not mistaken for a broken connection.
 fn komari_ok(id: &serde_json::Value) -> Response {
-    Json(json!({"jsonrpc": "2.0", "id": id, "result": {"status": "success", "events": []}})).into_response()
+    komari_reply(id, Vec::new())
+}
+
+/// Distinguishes one queued event from the next.
+///
+/// The agent deduplicates queued events by id and forgets an id only after a
+/// TTL, while the same probe is assigned again every period. A reused id would
+/// therefore be swallowed from the second period onward and the probe would go
+/// quiet after one reading, so a fresh one is minted per delivery.
+static EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// The reply to `agent.pull`, carrying whatever has come due.
+///
+/// A v2 client on the POST fallback has no socket, so this is the only channel
+/// its assignments can reach it on. The assignments are marked as sent here
+/// rather than when the agent acknowledges them: the reply is already on its
+/// way, and one lost reply costs a single period instead of leaving a backlog
+/// that the next successful pull would hand over all at once.
+fn komari_pull_ok(app: &App, node_id: i64, id: &serde_json::Value) -> Response {
+    let due = due_probes(app, node_id);
+    let events: Vec<serde_json::Value> = due
+        .iter()
+        .map(|probe| {
+            let event = format!("ping-{}-{}", probe.id, EVENTS.fetch_add(1, Ordering::Relaxed));
+            komari_compat::ping_event_queued(&event, probe)
+        })
+        .collect();
+    mark_pushed(app, node_id, &due);
+    komari_reply(id, events)
+}
+
+fn komari_reply(id: &serde_json::Value, events: Vec<serde_json::Value>) -> Response {
+    Json(json!({"jsonrpc": "2.0", "id": id, "result": {"status": "success", "events": events}}))
+        .into_response()
 }
 
 /// The HTTP POST endpoint a komari-agent falls back to, and the only channel
@@ -271,8 +304,15 @@ pub async fn komari_post_handler(
                 Err(e) => fail(&e),
             }
         }
-        // pingResult / taskResult / event / pull and anything else: nothing to
-        // do yet, but the agent must not treat the channel as broken.
+        komari_compat::METHOD_PING_RESULT => match file_ping_result(&app, node_id, &rpc.params) {
+            Ok(()) => komari_ok(&rpc.id),
+            Err(e) => fail(&e),
+        },
+        // A node on the POST fallback reports and is assigned over this same
+        // endpoint, so the one poll it makes is where its probes are handed over.
+        komari_compat::METHOD_PULL => komari_pull_ok(&app, node_id, &rpc.id),
+        // taskResult / event and anything else: nothing consumes them yet, but
+        // the agent must not treat the channel as broken.
         _ => komari_ok(&rpc.id),
     }
 }
@@ -337,9 +377,11 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket, kom
     app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx, komari));
     info!("node {node_id} {}connected from {ip}", if komari { "komari " } else { "" });
 
-    // Send the probe list before the first report arrives. A komari-agent
-    // speaks its own protocol and would ignore this frame, so it is skipped on
-    // that path.
+    // Send the probe list before the first report arrives, so the first probe
+    // runs within one interval of connecting rather than waiting for a panel
+    // edit to push one. A komari-agent is not sent this frame: its assignments
+    // are measured one at a time and timed hub-side, so they come from
+    // `spawn_komari_probes` instead.
     if !komari {
         let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
     }
@@ -408,6 +450,13 @@ fn release(app: &App, node_id: i64, session: u64) -> bool {
         return false;
     }
     agents.remove(&node_id);
+    drop(agents);
+    // A reconnect must not inherit the periods of the session it replaced: a
+    // probe pushed a moment before the socket died would otherwise wait out its
+    // whole interval, leaving a gap on the chart where the agent was merely
+    // asked too late. Dropped before this only for tidiness -- the two locks are
+    // never held together.
+    forget_pushed(app, node_id);
     true
 }
 
@@ -438,8 +487,9 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
 /// Handles one inbound frame from a komari-agent. `agent.report` is converted
 /// and filed through the native pipeline (which owns validation, traffic
 /// accumulation, minute averaging and the live view); `agent.basicInfo` updates
-/// the stored host facts. The remaining methods are logged and ignored, as the
-/// compat plan intends until ping/exec results are implemented.
+/// the stored host facts, and `agent.pingResult` becomes a latency sample. The
+/// remaining methods are logged and ignored, as the compat plan intends until
+/// exec and event results are implemented.
 fn komari_dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
     let rpc: Rpc = serde_json::from_str(text)?;
     match rpc.method.as_str() {
@@ -451,17 +501,35 @@ fn komari_dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool
             let info = rpc.params.get("info").cloned().unwrap_or(serde_json::Value::Null);
             app.db.save_facts(node_id, &komari_compat::convert_komari_basic_info(&info), ip)?;
         }
-        // Ping and exec results, and events: nothing consumes them yet, but a
-        // distinct log line keeps the gap visible while the compat plan fills
-        // it in.
-        komari_compat::METHOD_PING_RESULT
-        | komari_compat::METHOD_TASK_RESULT
-        | komari_compat::METHOD_EVENT => {
+        komari_compat::METHOD_PING_RESULT => file_ping_result(app, node_id, &rpc.params)?,
+        // Exec results and events: nothing consumes them yet, but a distinct log
+        // line keeps the gap visible while the compat plan fills it in.
+        komari_compat::METHOD_TASK_RESULT | komari_compat::METHOD_EVENT => {
             debug!("node {node_id} sent komari {}; ignored for now", rpc.method)
         }
         other => debug!("node {node_id} sent ignored komari method {other}"),
     }
     Ok(false)
+}
+
+/// Files one komari ping reading through the native store, from either channel.
+///
+/// Both checks that matter already live behind `insert_ping`: a negative value is
+/// the lost packet komari itself reports, and a probe not assigned to this node
+/// is dropped. Nothing is repeated here, so the two protocols cannot drift on
+/// what counts as a reading.
+///
+/// Stamped with the hub's clock rather than the `finished_at` komari sends: the
+/// chart buckets by this stamp, and a node whose clock is off would otherwise
+/// file its readings into buckets of its own choosing. The native path has the
+/// same rule.
+fn file_ping_result(app: &App, node_id: i64, params: &serde_json::Value) -> Result<()> {
+    let Some((task_id, value)) = komari_compat::ping_result(params) else {
+        debug!("node {node_id} sent an agent.pingResult carrying no reading");
+        return Ok(());
+    };
+    app.db.insert_ping(node_id, task_id, Utc::now().timestamp(), value)?;
+    Ok(())
 }
 
 /// When each node was last looked up.
@@ -654,14 +722,22 @@ fn ping_tasks_message(app: &App, node_id: i64) -> String {
     json!({"jsonrpc": "2.0", "method": "ping.tasks", "params": tasks}).to_string()
 }
 
-/// Pushes the current probe list to every connected agent, so a panel edit takes
-/// effect without waiting for a reconnect.
+/// Pushes the current probe list to every connected native agent, so a panel
+/// edit takes effect without waiting for a reconnect.
+///
+/// komari sessions are skipped. `ping.tasks` is the native list, which a
+/// komari-agent does not act on: its assignments arrive one probe at a time and
+/// are timed here (see [`spawn_komari_probes`]). A frame it ignores would be
+/// harmless, but this is the one place the two protocols have to be told apart,
+/// and a node is whatever its session speaks rather than what its row happens to
+/// be configured as.
 pub fn push_ping_tasks(app: &App) {
     let connected: Vec<(i64, mpsc::Sender<String>)> = app
         .agents
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
+        .filter(|(_, agent)| !agent.komari)
         .map(|(id, agent)| (*id, agent.tx.clone()))
         .collect();
     for (node_id, sender) in connected {
@@ -673,6 +749,97 @@ pub fn push_ping_tasks(app: &App) {
             warn!("node {node_id} is not draining its queue; it gets the new probe list when it reconnects");
         }
     }
+}
+
+/// The assignments that are due on a node, along with the state that decides it.
+///
+/// A native agent receives its probes once and runs the timers itself. A
+/// komari-agent does neither: the assignment carries no interval and the agent
+/// measures once per assignment, so the cadence belongs to whichever hub is
+/// talking to it -- komari's own server groups its probes by interval and
+/// re-sends on that period. Keeping the last-sent instant is how the same thing
+/// is done here, and [`App::ping_pushed`] is that map.
+///
+/// Sending is the caller's job, and it must call [`mark_pushed`] once the frame
+/// is away: a queue that refuses the push has to leave the assignment due rather
+/// than skip a period in silence.
+///
+/// The task table is re-read every call, so an operator's edit lands on the next
+/// tick with nothing to invalidate. Entries for assignments that no longer exist
+/// are dropped here, and [`release`] drops a node's entries outright.
+fn due_probes(app: &App, node_id: i64) -> Vec<Probe> {
+    let probes = app.db.ping_tasks_for(node_id).unwrap_or_default();
+    let now = Instant::now();
+    let mut pushed = app.ping_pushed.lock().unwrap_or_else(|e| e.into_inner());
+    pushed.retain(|key, _| key.0 != node_id || probes.iter().any(|probe| probe.id == key.1));
+    probes
+        .into_iter()
+        // `max(1)` rather than the stored value: the interval is validated on
+        // the way in (5..=3600) and clamped again by the agent, so a zero can
+        // only arrive from an older database -- where it would otherwise make
+        // the probe due on every tick.
+        .filter(|probe| {
+            pushed
+                .get(&(node_id, probe.id))
+                .is_none_or(|at| now.duration_since(*at).as_secs() >= probe.interval.max(1) as u64)
+        })
+        .collect()
+}
+
+/// Records that these assignments have been handed over, so they are not due
+/// again before their own period has passed.
+fn mark_pushed(app: &App, node_id: i64, probes: &[Probe]) {
+    let mut pushed = app.ping_pushed.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    for probe in probes {
+        pushed.insert((node_id, probe.id), now);
+    }
+}
+
+/// Forgets a node's assignments, so a reconnect starts from a clean slate rather
+/// than inheriting the periods of the session it replaces.
+fn forget_pushed(app: &App, node_id: i64) {
+    app.ping_pushed.lock().unwrap_or_else(|e| e.into_inner()).retain(|key, _| key.0 != node_id);
+}
+
+/// Drives the probes of every connected komari agent.
+///
+/// One tick for the whole hub rather than one timer per node: the probe table is
+/// read once per tick, and only for the nodes that are actually connected over
+/// komari. A second of granularity is well inside the five-second floor
+/// `save_ping_task` enforces, and it is what makes a panel edit take effect
+/// without pushing anything to invalidate a cached list.
+pub fn spawn_komari_probes(app: Shared) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            // Collected before sending: the guard over `agents` must not be held
+            // across a `try_send`, and a session installed or retired mid-tick is
+            // picked up by the next one.
+            let sessions: Vec<(i64, mpsc::Sender<String>)> = app
+                .agents
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(_, agent)| agent.komari)
+                .map(|(id, agent)| (*id, agent.tx.clone()))
+                .collect();
+            for (node_id, sender) in sessions {
+                for probe in due_probes(&app, node_id) {
+                    let frame = komari_compat::ping_event(&probe).to_string();
+                    if sender.try_send(frame).is_err() {
+                        // Same reasoning as the native push above: a full queue is
+                        // an agent that has stopped reading. The assignment stays
+                        // due, and the session is dropped within SILENCE.
+                        warn!("node {node_id} is not draining its probe queue; the probe waits for the next tick");
+                        break;
+                    }
+                    mark_pushed(&app, node_id, std::slice::from_ref(&probe));
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -697,6 +864,38 @@ mod tests {
         let (tx, rx) = mpsc::channel(4);
         app.agents.write().unwrap().insert(id, Agent::new(1, tx, false));
         (id, rx)
+    }
+
+    /// The same, over the komari protocol. Which path a session is on is the
+    /// only thing that decides how its probes are assigned, so a test of that
+    /// branch needs one of each.
+    fn connect_komari(app: &App) -> (i64, mpsc::Receiver<String>) {
+        let id = app
+            .db
+            .create_node(&Node { name: "k".into(), traffic_reset_day: 1, ..Default::default() }, "komari-tok")
+            .unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        app.agents.write().unwrap().insert(id, Agent::new(1, tx, true));
+        (id, rx)
+    }
+
+    /// Assigns one probe to a node and returns its id.
+    fn assign(app: &App, node_id: i64, interval: i64) -> i64 {
+        app.db
+            .save_ping_task(&PingTask {
+                id: 0,
+                name: "p".into(),
+                target: "1.1.1.1:443".into(),
+                interval,
+                nodes: vec![node_id],
+            })
+            .unwrap()
+    }
+
+    /// The JSON body of a response, for asserting on a wire shape.
+    async fn body(r: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     fn report_json(boot: &str, rx: i64, tx: i64) -> String {
@@ -1039,5 +1238,162 @@ mod tests {
         assert!(dispatch(&app, id, "ip", "not json").is_err());
         // Unknown methods are ignored.
         assert!(dispatch(&app, id, "ip", r#"{"method":"whatever"}"#).is_ok());
+    }
+
+    /// One `agent.pingResult` as the agent sends it.
+    fn ping_result_frame(task_id: i64, value: serde_json::Value) -> String {
+        json!({"jsonrpc": "2.0", "method": "agent.pingResult",
+               "params": {"task_id": task_id, "ping_type": "tcp", "value": value}})
+        .to_string()
+    }
+
+    /// The whole point of the komari branch: a reading the agent reports arrives
+    /// as a latency sample, on the same terms as a native `ping.result`.
+    ///
+    /// One reading per test, because a sample is keyed by `(node, probe, second)`
+    /// and `insert_ping` is an `INSERT OR REPLACE`: two readings dispatched
+    /// inside the same second are one row, the later replacing the earlier. That
+    /// is the store's own rule rather than anything this path adds -- the
+    /// database tests space their samples out for the same reason.
+    #[test]
+    fn a_komari_ping_result_becomes_a_latency_sample() {
+        let app = app();
+        let (id, _held) = connect_komari(&app);
+        let probe = assign(&app, id, 60);
+        komari_dispatch(&app, id, "ip", &ping_result_frame(probe, json!(42))).unwrap();
+
+        let (rows, loss) = app.db.ping_records(id, 0, 60).unwrap();
+        assert_eq!(rows.len(), 1, "one probe, one bucket");
+        assert_eq!(rows[0]["task_id"], probe);
+        assert_eq!(rows[0]["latency"], 42);
+        assert_eq!(loss, json!({}), "a probe that answered has no loss to report");
+    }
+
+    /// komari reports a probe that did not answer as -1. It is the same lost
+    /// packet the native pipeline counts, not a latency of minus one millisecond.
+    #[test]
+    fn a_komari_probe_that_did_not_answer_reads_as_loss_not_latency() {
+        let app = app();
+        let (id, _held) = connect_komari(&app);
+        let probe = assign(&app, id, 60);
+        komari_dispatch(&app, id, "ip", &ping_result_frame(probe, json!(-1))).unwrap();
+
+        let (rows, loss) = app.db.ping_records(id, 0, 60).unwrap();
+        assert_eq!(rows[0]["latency"], json!(null), "a bucket that was all timeout has no latency");
+        let key = probe.to_string();
+        assert_eq!(loss[key.as_str()], 100.0);
+    }
+
+    /// A frame with no reading, and one for a probe this node was never assigned.
+    /// Neither is a sample, and neither may be filed as the -1 above, which would
+    /// draw an outage that never happened.
+    #[test]
+    fn a_komari_ping_result_without_a_reading_files_nothing() {
+        let app = app();
+        let (id, _held) = connect_komari(&app);
+        let probe = assign(&app, id, 60);
+
+        komari_dispatch(&app, id, "ip", &ping_result_frame(probe, json!(null))).unwrap();
+        komari_dispatch(&app, id, "ip", &ping_result_frame(probe, json!("fast"))).unwrap();
+        komari_dispatch(
+            &app,
+            id,
+            "ip",
+            &json!({"jsonrpc": "2.0", "method": "agent.pingResult",
+                    "params": {"task_id": probe}})
+            .to_string(),
+        )
+        .unwrap();
+        // Assigned to no node, so `insert_ping` drops it rather than filing it
+        // against this one.
+        komari_dispatch(&app, id, "ip", &ping_result_frame(probe + 999, json!(7))).unwrap();
+
+        let (rows, loss) = app.db.ping_records(id, 0, 60).unwrap();
+        assert!(rows.is_empty(), "nothing was filed");
+        assert_eq!(loss, json!({}), "and nothing was counted as lost");
+    }
+
+    /// A probe is assigned over whichever protocol the node's session speaks.
+    /// The native list would be ignored by a komari-agent, and a komari
+    /// assignment is meaningless to a native one, so neither may be sent to the
+    /// other.
+    #[test]
+    fn each_session_is_told_about_its_probes_in_its_own_protocol() {
+        let app = app();
+        let (native, mut native_rx) = connect(&app);
+        let (komari, mut komari_rx) = connect_komari(&app);
+        assign(&app, native, 60);
+        assign(&app, komari, 60);
+
+        push_ping_tasks(&app);
+
+        let frame = native_rx.try_recv().expect("a native agent gets the list");
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["method"], "ping.tasks");
+        assert_eq!(v["params"].as_array().unwrap().len(), 1);
+        assert_eq!(v["params"][0]["target"], "1.1.1.1:443");
+
+        assert!(
+            komari_rx.try_recv().is_err(),
+            "a komari session is driven by the probe scheduler, not by the native list"
+        );
+    }
+
+    /// komari assignments carry no interval and the agent runs one measurement
+    /// per assignment, so the period is kept here. Every probe has its own.
+    #[test]
+    fn a_komari_probe_is_due_once_per_its_own_period() {
+        let app = app();
+        let (id, _held) = connect_komari(&app);
+        let fast = assign(&app, id, 5);
+        let slow = assign(&app, id, 3600);
+        let due = || -> Vec<i64> { due_probes(&app, id).iter().map(|p| p.id).collect() };
+
+        assert_eq!(due(), vec![fast, slow], "a newly assigned probe runs at once");
+        mark_pushed(&app, id, &due_probes(&app, id));
+        assert!(due().is_empty(), "and not again before its period has passed");
+
+        // That map is the only clock in the path, and a test cannot wait five
+        // seconds: rewinding one entry stands in for the period having elapsed.
+        // It lives on the `App`, so this hub's entries are the only ones here.
+        app.ping_pushed.lock().unwrap().insert((id, fast), Instant::now() - Duration::from_secs(6));
+        assert_eq!(due(), vec![fast], "the fast probe is due while the hourly one is not");
+
+        // A probe an operator deletes is forgotten, not remembered forever.
+        app.db.delete_ping_task(fast).unwrap();
+        assert!(due().is_empty());
+        assert!(
+            !app.ping_pushed.lock().unwrap().contains_key(&(id, fast)),
+            "the assignment is pruned with the row"
+        );
+    }
+
+    /// A node on the POST fallback has no socket, so the reply to its own poll is
+    /// the only way an assignment reaches it.
+    #[tokio::test]
+    async fn a_pull_reply_hands_over_a_due_assignment_once() {
+        let app = app();
+        let (id, _held) = connect_komari(&app);
+        let probe = assign(&app, id, 60);
+
+        let reply = body(komari_pull_ok(&app, id, &json!("pull-1"))).await;
+        assert_eq!(reply["id"], "pull-1", "the agent matches the reply to its request");
+        assert_eq!(reply["result"]["status"], "success");
+        let events = reply["result"]["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["method"], "agent.ping");
+        assert_eq!(events[0]["params"]["ping_task_id"], probe);
+        assert_eq!(events[0]["params"]["ping_type"], "tcp");
+        assert_eq!(events[0]["params"]["ping_target"], "1.1.1.1:443");
+        assert!(
+            events[0]["id"].as_str().is_some_and(|s| !s.is_empty()),
+            "a queued event is deduplicated by id, so it needs one"
+        );
+
+        let again = body(komari_pull_ok(&app, id, &json!("pull-2"))).await;
+        assert!(
+            again["result"]["events"].as_array().unwrap().is_empty(),
+            "the period has not passed, so the same assignment is not handed over twice"
+        );
     }
 }

@@ -477,6 +477,19 @@ pub struct PingTask {
     pub nodes: Vec<i64>,
 }
 
+/// One probe as an agent receives it: the three fields a run needs, without the
+/// operator-facing name or the assignment list.
+///
+/// Serialised straight into both pushes -- the native `ping.tasks` list and each
+/// komari `agent.ping` event -- so the two protocols cannot drift apart on field
+/// names. `Serialize` only: nothing reads one back.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Probe {
+    pub id: i64,
+    pub target: String,
+    pub interval: i64,
+}
+
 /// Restricts the database to its owner.
 ///
 /// It is the credential store: node tokens in the clear, the GitHub client
@@ -1184,18 +1197,14 @@ impl Db {
     /// the timers each time; `save_ping_task` prevents reaching that boundary,
     /// and this makes the backstop deterministic should a database arrive there
     /// by another route.
-    pub fn ping_tasks_for(&self, node_id: i64) -> Result<Vec<serde_json::Value>> {
+    pub fn ping_tasks_for(&self, node_id: i64) -> Result<Vec<Probe>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT t.id, t.target, t.interval FROM ping_task t
              JOIN ping_node n ON n.task_id = t.id WHERE n.node_id = ?1 ORDER BY t.id",
         )?;
-        let rows = stmt.query_map([node_id], |r| {
-            Ok(serde_json::json!({
-                "id": r.get::<_, i64>(0)?, "target": r.get::<_, String>(1)?,
-                "interval": r.get::<_, i64>(2)?
-            }))
-        })?;
+        let rows = stmt
+            .query_map([node_id], |r| Ok(Probe { id: r.get(0)?, target: r.get(1)?, interval: r.get(2)? }))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
