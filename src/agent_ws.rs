@@ -232,6 +232,27 @@ fn komari_ok(id: &serde_json::Value) -> Response {
 /// quiet after one reading, so a fresh one is minted per delivery.
 static EVENTS: AtomicU64 = AtomicU64::new(0);
 
+/// How long an `agent.pull` on the POST fallback is held open waiting for an
+/// assignment, and how often the probe table is re-read while it waits.
+///
+/// A komari-agent paces its reports but not its pulls: the loop behind them
+/// retries immediately on success and only backs off after a failure (its
+/// `runV2PullLoop`). The cadence is therefore the server's to keep, and komari's
+/// own server keeps it the same way -- it holds the request up to 25 seconds
+/// waiting for an event (`WaitV2Events`) before answering. Replying at once, as
+/// this hub did, leaves a fallback node polling as fast as its round trip
+/// allows, and every one of those polls reads the probe table.
+///
+/// 25 rather than anything else because that is what the agent's own server
+/// does, and what its HTTP client tolerates: that client allows 35 seconds for a
+/// response.
+const PULL_HOLD: Duration = Duration::from_secs(25);
+
+/// The granularity an assignment handed over on this path can be late by. The
+/// probe scheduler ticks at a second and the shortest interval is five, so this
+/// is well inside what the probes themselves resolve.
+const PULL_POLL: Duration = Duration::from_secs(1);
+
 /// The reply to `agent.pull`, carrying whatever has come due.
 ///
 /// A v2 client on the POST fallback has no socket, so this is the only channel
@@ -239,8 +260,24 @@ static EVENTS: AtomicU64 = AtomicU64::new(0);
 /// rather than when the agent acknowledges them: the reply is already on its
 /// way, and one lost reply costs a single period instead of leaving a backlog
 /// that the next successful pull would hand over all at once.
-fn komari_pull_ok(app: &App, node_id: i64, id: &serde_json::Value) -> Response {
-    let due = due_probes(app, node_id);
+///
+/// Nothing due means the request is held open rather than answered with an empty
+/// list, for the reason [`PULL_HOLD`] gives: the hub, not the agent, keeps this
+/// cadence. Holding also delivers an assignment sooner than the next poll would,
+/// since the reply leaves on the first re-check that finds one -- a period
+/// expiring mid-wait does not have to wait for the agent to ask again.
+async fn komari_pull_ok(app: &App, node_id: i64, id: &serde_json::Value) -> Response {
+    let mut due = due_probes(app, node_id);
+    if due.is_empty() {
+        let deadline = tokio::time::Instant::now() + PULL_HOLD;
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(PULL_POLL).await;
+            due = due_probes(app, node_id);
+            if !due.is_empty() {
+                break;
+            }
+        }
+    }
     let events: Vec<serde_json::Value> = due
         .iter()
         .map(|probe| {
@@ -309,8 +346,9 @@ pub async fn komari_post_handler(
             Err(e) => fail(&e),
         },
         // A node on the POST fallback reports and is assigned over this same
-        // endpoint, so the one poll it makes is where its probes are handed over.
-        komari_compat::METHOD_PULL => komari_pull_ok(&app, node_id, &rpc.id),
+        // endpoint, so the one poll it makes is where its probes are handed over
+        // -- held open when there is nothing to hand over, see `PULL_HOLD`.
+        komari_compat::METHOD_PULL => komari_pull_ok(&app, node_id, &rpc.id).await,
         // taskResult / event and anything else: nothing consumes them yet, but
         // the agent must not treat the channel as broken.
         _ => komari_ok(&rpc.id),
@@ -1370,13 +1408,16 @@ mod tests {
 
     /// A node on the POST fallback has no socket, so the reply to its own poll is
     /// the only way an assignment reaches it.
-    #[tokio::test]
+    ///
+    /// Paused time: the second poll is held open, and no test can wait that out.
+    #[tokio::test(start_paused = true)]
     async fn a_pull_reply_hands_over_a_due_assignment_once() {
         let app = app();
         let (id, _held) = connect_komari(&app);
         let probe = assign(&app, id, 60);
 
-        let reply = body(komari_pull_ok(&app, id, &json!("pull-1"))).await;
+        let started = tokio::time::Instant::now();
+        let reply = body(komari_pull_ok(&app, id, &json!("pull-1")).await).await;
         assert_eq!(reply["id"], "pull-1", "the agent matches the reply to its request");
         assert_eq!(reply["result"]["status"], "success");
         let events = reply["result"]["events"].as_array().unwrap();
@@ -1389,11 +1430,21 @@ mod tests {
             events[0]["id"].as_str().is_some_and(|s| !s.is_empty()),
             "a queued event is deduplicated by id, so it needs one"
         );
+        assert!(started.elapsed() < PULL_POLL, "an assignment that is due is not waited on");
 
-        let again = body(komari_pull_ok(&app, id, &json!("pull-2"))).await;
+        // Nothing due: the reply is held rather than sent empty. That hold is
+        // what paces a fallback node, whose own poll loop does not pause.
+        let started = tokio::time::Instant::now();
+        let again = body(komari_pull_ok(&app, id, &json!("pull-2")).await).await;
         assert!(
             again["result"]["events"].as_array().unwrap().is_empty(),
             "the period has not passed, so the same assignment is not handed over twice"
+        );
+        assert_eq!(again["result"]["status"], "success", "a held pull is still a success");
+        assert!(
+            started.elapsed() >= PULL_HOLD,
+            "an idle pull waits out the hold, then answers: {:?}",
+            started.elapsed()
         );
     }
 }

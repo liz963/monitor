@@ -26,7 +26,8 @@
 延迟检测也按会话协议分发。原生 session 连接时收一次 `ping.tasks`，之后自己按 interval 调度；
 komari session 收的是 komari 的 `agent.ping`（一次一条，`ping_type` 固定 `tcp`），
 因为 komari-agent 每收到一次只测一次，节拍改由 hub 侧按探针的 interval 驱动；没有 socket 的
-POST 降级则把探针搭在 `agent.pull` 回复的 `result.events[]` 里。上报侧
+POST 降级则把探针搭在 `agent.pull` 回复的 `result.events[]` 里，空闲时按住最多 25 秒再回
+（与官方服务端一致——agent 那个轮询循环成功时不会自己暂停，节拍只能由服务端给）。上报侧
 `agent.pingResult` 的 `value` 与原生 `ping.result` 的 `latency_ms` 同义，都是负数表示丢包，
 两边最终落到同一张 `ping_record`。
 
