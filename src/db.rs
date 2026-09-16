@@ -62,11 +62,12 @@ CREATE TABLE IF NOT EXISTS node (
   -- Survives the disconnection it describes, unlike the in-memory live entry:
   -- an offline node's page is exactly where "since when" is worth reading.
   last_seen INTEGER NOT NULL DEFAULT 0,
-  -- Opt-in, as the operator decides which machines are worth an alert.
+  -- The per-node alert opt-in and the offline stamp of a release that shipped
+  -- them. Nothing reads either today -- notifications are switched per channel,
+  -- not per node -- but they stay in the schema so that version 4 keeps meaning
+  -- what it already meant to a database in service, and so a fresh file and an
+  -- upgraded one have the same shape.
   notify INTEGER NOT NULL DEFAULT 0,
-  -- `last_seen` as of the offline alert, zero while none is outstanding. Stored
-  -- rather than held in memory so that a hub restart neither repeats the alert
-  -- nor loses the recovery that pairs with it.
   down_since INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
@@ -225,6 +226,9 @@ fn migrate_to_3(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "country TEXT NOT NULL DEFAULT ''")
 }
 
+/// The per-node alert opt-in and its offline stamp. Kept as the definition of
+/// version 4 even though nothing reads either column now: a database already
+/// stamped 4 must not be asked to run this revision again under a new meaning.
 fn migrate_to_4(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "notify INTEGER NOT NULL DEFAULT 0")?;
     add_column(conn, "node", "down_since INTEGER NOT NULL DEFAULT 0")
@@ -323,11 +327,6 @@ pub struct Node {
     /// the metric row. Zero for a node that has never reported.
     #[serde(default)]
     pub last_seen: i64,
-    /// Whether going offline and coming back are announced. See `notify`.
-    #[serde(default)]
-    pub notify: bool,
-    #[serde(default)]
-    pub down_since: i64,
     /// What the agent authenticates with. Readable so the panel can display an
     /// install command on demand; it never leaves the admin view.
     #[serde(default)]
@@ -353,7 +352,6 @@ pub struct NodePatch {
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
-    pub notify: Option<bool>,
 }
 
 fn expiry_patch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
@@ -573,8 +571,7 @@ impl Db {
                              expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
                              remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
                              traffic_mode=COALESCE(?12,traffic_mode),
-                             traffic_reset_day=COALESCE(?13,traffic_reset_day),
-                             notify=COALESCE(?14,notify)
+                             traffic_reset_day=COALESCE(?13,traffic_reset_day)
              WHERE id=?1",
             params![
                 id,
@@ -589,8 +586,7 @@ impl Db {
                 n.remark,
                 n.traffic_limit,
                 n.traffic_mode,
-                n.traffic_reset_day,
-                n.notify
+                n.traffic_reset_day
             ],
         )?;
         Ok(())
@@ -598,11 +594,6 @@ impl Db {
 
     pub fn set_expiry(&self, id: i64, date: &str) -> Result<()> {
         self.conn().execute("UPDATE node SET expires_at=?2 WHERE id=?1", params![id, date])?;
-        Ok(())
-    }
-
-    pub fn set_down_since(&self, id: i64, ts: i64) -> Result<()> {
-        self.conn().execute("UPDATE node SET down_since=?2 WHERE id=?1", params![id, ts])?;
         Ok(())
     }
 
@@ -1553,8 +1544,6 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         ipv6: s("ipv6"),
         country: s("country"),
         last_seen: n("last_seen"),
-        notify: n("notify") != 0,
-        down_since: n("down_since"),
         token: s("token"),
     }
 }

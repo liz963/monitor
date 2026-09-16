@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Send, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
+import { CalendarClock, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Server, Settings, Shield, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -259,13 +259,6 @@ function NodeForm({ node, onClose, onSaved }: {
               <span className="mt-0.5 block text-xs text-muted-foreground">关闭后只在管理后台可见</span>
             </span>
             <Switch checked={form.public} onCheckedChange={(v) => set("public", v)} />
-          </label>
-          <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
-            <span>
-              <span className="block font-medium">离线通知</span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">掉线超过宽限期推送一条，恢复在线时再推一条</span>
-            </span>
-            <Switch checked={!!form.notify} onCheckedChange={(v) => set("notify", v)} />
           </label>
         </div>
         <DialogFooter>
@@ -1200,16 +1193,6 @@ function useSettings() {
       try {
         await api("/settings", { method: "PUT", body: JSON.stringify(patch) })
         toast.success("已保存")
-        // Only the saved keys and the `*_set` flags are taken from the hub: a
-        // credential comes back as a flag, so the typed value must not linger,
-        // while another card's unsaved edits on the same page must survive.
-        const fresh = await api<Settings>("/settings")
-        setS((old) => {
-          const next = { ...old }
-          for (const key of Object.keys(patch)) next[key] = fresh[key]
-          for (const [key, value] of Object.entries(fresh)) if (key.endsWith("_set")) next[key] = value
-          return next
-        })
       } catch (e) {
         toast.error((e as Error).message)
       }
@@ -1276,273 +1259,206 @@ function SettingsTab() {
           </Button>
         </div>
       </Card>
-    </div>
-  )
-}
 
-const TEXTAREA =
-  "w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-xs outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
-
-// One offline alert, filled in the way the hub fills a template: in a single pass,
-// JSON-escaped for the webhook body. Previews only; nothing here is sent.
-const SAMPLE_NOTE: Record<string, string> = {
-  event: "offline",
-  node: "香港 · 甲商家",
-  title: "🔴 香港 · 甲商家 离线",
-  message: "最后上报 09-15 20:13 +08:00",
-  time: "09-15 20:16 +08:00",
-}
-
-const PLACEHOLDERS = "{{title}} {{message}} {{node}} {{event}} {{site}} {{time}}"
-
-function TemplatePreview({ template, site, json = false }: { template: string; site: string; json?: boolean }) {
-  if (!template.trim()) return <p className="text-xs text-muted-foreground">留空保存即恢复默认模板</p>
-  const values = { ...SAMPLE_NOTE, site }
-  let out = template.replace(/\{\{(event|node|title|message|site|time)\}\}/g, (_, key: keyof typeof values) =>
-    json ? JSON.stringify(values[key]).slice(1, -1) : values[key],
-  )
-  if (json) {
-    try {
-      out = JSON.stringify(JSON.parse(out), null, 2)
-    } catch {
-      return (
-        <p className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
-          代入后不是合法 JSON，保存会被拒绝。占位符要写在引号里，例如 "text": "{"{{title}}"}"
-        </p>
-      )
-    }
-  }
-  return (
-    <div className="space-y-1">
-      <div className="text-xs text-muted-foreground">预览（以一条离线通知为例）</div>
-      <pre className="overflow-x-auto rounded-md bg-muted/50 px-3 py-2 font-mono text-xs whitespace-pre-wrap break-all">{out}</pre>
-    </div>
-  )
-}
-
-// A channel's form, collapsed until needed. The summary carries whether the
-// channel is configured, so the closed card still answers the common question.
-function ChannelCard({ title, configured, children }: { title: string; configured: boolean; children: React.ReactNode }) {
-  return (
-    <Card className="p-5">
-      <details className="group">
-        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 rounded-md outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
-          <span className="flex items-center gap-2 text-sm font-medium">
-            <ChevronRight className="size-4 text-muted-foreground transition-transform group-open:rotate-90" />
-            {title}
-          </span>
-          <Badge variant={configured ? "secondary" : "outline"}>{configured ? "已配置" : "未配置"}</Badge>
-        </summary>
-        <div className="mt-4 space-y-4">{children}</div>
-      </details>
-    </Card>
-  )
-}
-
-// Offline alerts are opt-in per node, so turning them on for a fleet needs one
-// place rather than one dialog per node.
-function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const [busy, setBusy] = useState(false)
-
-  async function apply(targets: Node[], on: boolean) {
-    setBusy(true)
-    try {
-      // Awaited in turn, the requests would cost one round trip per node, and
-      // the two-second stream would render each one as it lands.
-      await Promise.all(
-        targets
-          .filter((n) => !!n.notify !== on)
-          .map((n) => api(`/nodes/${n.id}`, { method: "PUT", body: JSON.stringify({ notify: on }) })),
-      )
-    } catch (e) {
-      toast.error((e as Error).message)
-    } finally {
-      refresh()
-      setBusy(false)
-    }
-  }
-
-  const enabled = nodes.filter((n) => n.notify).length
-  return (
-    <Card className="gap-4 p-5">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <h3 className="text-sm font-medium">离线通知</h3>
-          <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled} / {nodes.length} 台</p>
-        </div>
-        <div className="flex gap-2">
-          <Button size="sm" variant="secondary" disabled={busy || enabled === nodes.length} onClick={() => apply(nodes, true)}>全部打开</Button>
-          <Button size="sm" variant="ghost" disabled={busy || enabled === 0} onClick={() => apply(nodes, false)}>全部关闭</Button>
-        </div>
-      </div>
-      {nodes.length > 0 && (
-        <div className="grid max-h-64 gap-x-6 gap-y-2 overflow-y-auto sm:grid-cols-2">
-          {nodes.map((node) => (
-            <label key={node.id} className="flex cursor-pointer items-center justify-between gap-3 text-sm">
-              <span className="truncate">{node.name}</span>
-              <Switch checked={!!node.notify} disabled={busy} onCheckedChange={(v) => apply([node], v)} />
-            </label>
-          ))}
-        </div>
-      )}
-    </Card>
-  )
-}
-
-function Notify({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const { s, set, save } = useSettings()
-  const [testing, setTesting] = useState(false)
-  if (!s) return null
-  const text = (k: string) => String(s[k] ?? "")
-  // A credential is sent only when something was typed: the field starts empty
-  // because the hub never returns the stored value.
-  const typed = (...keys: string[]) =>
-    Object.fromEntries(keys.filter((k) => typeof s[k] === "string" && s[k] !== "").map((k) => [k, text(k)]))
-  const secretHint = (k: string) => (s[`${k}_set`] ? "已设置，留空不变" : "未设置")
-
-  async function test() {
-    setTesting(true)
-    try {
-      const { sent } = await api<{ sent: string[] }>("/notify/test", { method: "POST" })
-      toast.success(`测试通知已发送：${sent.join("、")}`)
-    } catch (e) {
-      toast.error((e as Error).message)
-    } finally {
-      setTesting(false)
-    }
-  }
-
-  return (
-    <div className="space-y-4">
       <Card className="gap-4 p-5">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <h3 className="text-sm font-medium">通知渠道</h3>
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              Telegram 和 Webhook 配了哪个就发哪个，也可以同时用。离线通知在下方按节点打开；流量和到期提醒对填了额度、到期日的节点生效。
-            </p>
-          </div>
-          <Button size="sm" variant="secondary" disabled={testing} onClick={test}>
-            <Send /> {testing ? "发送中…" : "发送测试"}
-          </Button>
+        <div>
+          <h3 className="text-sm font-medium">通知</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            节点上线/掉线、登录后台时推送。总开关打开后，会调用所有已启用的渠道（PushPlus / SMTP / Telegram / Webhook）。
+          </p>
         </div>
-      </Card>
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-3 text-sm">
+          <label className="flex items-center gap-2">
+            <Switch
+              checked={s.notify_enabled === "on"}
+              onCheckedChange={(v) => set("notify_enabled", v ? "on" : "off")}
+              aria-labelledby="notify-master"
+            />
+            <span id="notify-master">启用通知</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <Switch
+              checked={s.notify_node_up === "on"}
+              onCheckedChange={(v) => set("notify_node_up", v ? "on" : "off")}
+              aria-labelledby="notify-up"
+            />
+            <span id="notify-up">节点上线</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <Switch
+              checked={s.notify_node_down === "on"}
+              onCheckedChange={(v) => set("notify_node_down", v ? "on" : "off")}
+              aria-labelledby="notify-down"
+            />
+            <span id="notify-down">节点掉线</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <Switch
+              checked={s.notify_login === "on"}
+              onCheckedChange={(v) => set("notify_login", v ? "on" : "off")}
+              aria-labelledby="notify-login"
+            />
+            <span id="notify-login">登录通知</span>
+          </label>
+        </div>
 
-      <ChannelCard title="Telegram" configured={!!s.notify_telegram_token_set && text("notify_telegram_chat") !== ""}>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="Bot Token" hint={secretHint("notify_telegram_token")}>
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <Switch
+              checked={s.pushplus_enabled === "on"}
+              onCheckedChange={(v) => set("pushplus_enabled", v ? "on" : "off")}
+              aria-labelledby="notify-pushplus"
+            />
+            <h4 id="notify-pushplus" className="text-sm font-medium">PushPlus 推送</h4>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            微信推送。Token 在 pushplus.plus 官网注册并绑定微信后，从个人中心获取。
+          </p>
+          <Field label="Token">
             <Input
-              type="password"
-              autoComplete="off"
-              placeholder={s.notify_telegram_token_set ? "••••••••" : "123456:ABC-DEF…"}
-              value={text("notify_telegram_token")}
-              onChange={(e) => set("notify_telegram_token", e.target.value)}
+              value={String(s.pushplus_token ?? "")}
+              onChange={(e) => set("pushplus_token", e.target.value)}
+              placeholder="pushplus 个人中心的 token"
             />
           </Field>
-          <Field label="Chat ID" hint="数字 ID，群组是负数；公开频道可填 @频道名">
-            <Input value={text("notify_telegram_chat")} onChange={(e) => set("notify_telegram_chat", e.target.value)} placeholder="-1001234567890" />
-          </Field>
         </div>
-        <Field label="消息模板" hint={`纯文本。占位符 ${PLACEHOLDERS}`}>
-          <textarea rows={3} className={TEXTAREA} value={text("notify_telegram_text")} onChange={(e) => set("notify_telegram_text", e.target.value)} />
-        </Field>
-        <TemplatePreview template={text("notify_telegram_text")} site={text("site_name") || "Monitor"} />
-        <div className="flex gap-2">
-          <Button
-            size="sm"
-            onClick={() =>
-              save({
-                notify_telegram_chat: text("notify_telegram_chat"),
-                notify_telegram_text: text("notify_telegram_text"),
-                ...typed("notify_telegram_token"),
-              })
-            }
-          >
-            保存 Telegram
-          </Button>
-          {s.notify_telegram_token_set && (
-            <Button size="sm" variant="ghost" onClick={() => save({ notify_telegram_token: "", notify_telegram_chat: "" })}>
-              清除
-            </Button>
-          )}
-        </div>
-      </ChannelCard>
 
-      <ChannelCard title="Webhook" configured={!!s.notify_webhook_url_set}>
-        <Field label="URL" hint={secretHint("notify_webhook_url")}>
-          <Input
-            type="password"
-            autoComplete="off"
-            placeholder={s.notify_webhook_url_set ? "••••••••" : "https://…"}
-            value={text("notify_webhook_url")}
-            onChange={(e) => set("notify_webhook_url", e.target.value)}
-          />
-        </Field>
-        <Field label="请求头" hint={`可选，一行一个。${s.notify_webhook_headers_set ? "已设置，留空不变" : ""}`}>
-          <textarea
-            rows={2}
-            className={TEXTAREA}
-            placeholder={s.notify_webhook_headers_set ? "••••••••" : "Authorization: Bearer xxx"}
-            value={text("notify_webhook_headers")}
-            onChange={(e) => set("notify_webhook_headers", e.target.value)}
-          />
-        </Field>
-        <Field label="请求体" hint={`以 POST 发送，Content-Type 为 application/json。占位符 ${PLACEHOLDERS}，须写在引号内`}>
-          <textarea rows={4} className={TEXTAREA} value={text("notify_webhook_body")} onChange={(e) => set("notify_webhook_body", e.target.value)} />
-        </Field>
-        <TemplatePreview template={text("notify_webhook_body")} site={text("site_name") || "Monitor"} json />
-        <div className="flex gap-2">
-          <Button
-            size="sm"
-            onClick={() => save({ notify_webhook_body: text("notify_webhook_body"), ...typed("notify_webhook_url", "notify_webhook_headers") })}
-          >
-            保存 Webhook
-          </Button>
-          {s.notify_webhook_headers_set && (
-            <Button size="sm" variant="ghost" onClick={() => save({ notify_webhook_headers: "" })}>
-              清除请求头
-            </Button>
-          )}
-          {s.notify_webhook_url_set && (
-            <Button size="sm" variant="ghost" onClick={() => save({ notify_webhook_url: "", notify_webhook_headers: "" })}>
-              清除
-            </Button>
-          )}
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <Switch
+              checked={s.smtp_enabled === "on"}
+              onCheckedChange={(v) => set("smtp_enabled", v ? "on" : "off")}
+              aria-labelledby="notify-smtp"
+            />
+            <h4 id="notify-smtp" className="text-sm font-medium">SMTP 邮箱</h4>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="SMTP 主机">
+              <Input value={String(s.smtp_host ?? "")} onChange={(e) => set("smtp_host", e.target.value)} placeholder="smtp.qq.com" />
+            </Field>
+            <Field label="端口">
+              <Input type="number" value={String(s.smtp_port ?? "")} onChange={(e) => set("smtp_port", e.target.value)} placeholder="465 / 587" />
+            </Field>
+            <Field label="用户名">
+              <Input value={String(s.smtp_username ?? "")} onChange={(e) => set("smtp_username", e.target.value)} placeholder="发件邮箱账号" />
+            </Field>
+            <Field label="密码" hint={s.smtp_password_set ? "已设置，留空不变" : "未设置"}>
+              <Input type="password" placeholder={s.smtp_password_set ? "••••••••" : ""} onChange={(e) => set("smtp_password", e.target.value)} />
+            </Field>
+            <Field label="发件人">
+              <Input value={String(s.smtp_from ?? "")} onChange={(e) => set("smtp_from", e.target.value)} placeholder="noreply@example.com" />
+            </Field>
+            <Field label="收件人">
+              <Input value={String(s.smtp_to ?? "")} onChange={(e) => set("smtp_to", e.target.value)} placeholder="you@example.com" />
+            </Field>
+            <Field label="加密方式">
+              <Select value={String(s.smtp_security ?? "starttls")} onValueChange={(v) => set("smtp_security", v)}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="tls">TLS（SSL，常见 465 端口）</SelectItem>
+                  <SelectItem value="starttls">STARTTLS（常见 587 端口）</SelectItem>
+                  <SelectItem value="none">无加密</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+          </div>
         </div>
-      </ChannelCard>
 
-      <OfflineNodes nodes={nodes} refresh={refresh} />
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <Switch
+              checked={s.telegram_enabled === "on"}
+              onCheckedChange={(v) => set("telegram_enabled", v ? "on" : "off")}
+              aria-labelledby="notify-telegram"
+            />
+            <h4 id="notify-telegram" className="text-sm font-medium">Telegram</h4>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            在 @BotFather 建一个机器人拿到 Bot Token，把机器人拉进目标会话后填入会话 id 或 @用户名。以纯文本发送，不设解析模式，节点名带符号也不会被拒收。
+          </p>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Bot Token" hint={s.telegram_token_set ? "已设置，留空不变" : "未设置"}>
+              <Input
+                type="password"
+                placeholder={s.telegram_token_set ? "••••••••" : "123456:ABC-DEF"}
+                onChange={(e) => set("telegram_token", e.target.value)}
+              />
+            </Field>
+            <Field label="会话" hint="数字 id 或 @用户名">
+              <Input
+                value={String(s.telegram_chat ?? "")}
+                onChange={(e) => set("telegram_chat", e.target.value)}
+                placeholder="-1001234567890"
+              />
+            </Field>
+          </div>
+        </div>
 
-      <Card className="gap-4 p-5">
-        <h3 className="text-sm font-medium">事件</h3>
-        <div className="grid gap-4 sm:grid-cols-3">
-          <Field label="离线宽限期（分钟）" hint="断开超过这么久才算离线，1–1440">
-            <Input type="number" min={1} max={1440} value={text("notify_grace")} onChange={(e) => set("notify_grace", e.target.value)} />
-          </Field>
-          <Field label="流量提醒（%）" hint="本期用量达到该比例和 100% 时各提醒一次，0 关闭">
-            <Input type="number" min={0} max={100} value={text("notify_traffic")} onChange={(e) => set("notify_traffic", e.target.value)} />
-          </Field>
-          <Field label="到期提醒（天）" hint="每天 9 点汇总这么多天内到期的节点，自动续期时也提醒，0 关闭">
-            <Input type="number" min={0} max={365} value={text("notify_expiry")} onChange={(e) => set("notify_expiry", e.target.value)} />
-          </Field>
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <Switch
+              checked={s.webhook_enabled === "on"}
+              onCheckedChange={(v) => set("webhook_enabled", v ? "on" : "off")}
+              aria-labelledby="notify-webhook"
+            />
+            <h4 id="notify-webhook" className="text-sm font-medium">Webhook</h4>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            把标题、正文与时间以 JSON POST 到指定地址，Discord、Slack、DingTalk、企业微信等均可接收。不跟随跳转，避免 POST 被改写成 GET 而静默失败。
+          </p>
+          <div className="grid gap-4">
+            <Field label="地址" hint={s.webhook_url_set ? "已设置，留空不变" : "未设置"}>
+              <Input
+                type="password"
+                placeholder={s.webhook_url_set ? "••••••••" : "https://example.com/hook"}
+                onChange={(e) => set("webhook_url", e.target.value)}
+              />
+            </Field>
+            <Field
+              label="附加请求头"
+              hint={s.webhook_headers_set ? "已设置，留空不变；每行一条 Name: value" : "每行一条，形如 Authorization: Bearer xxx"}
+            >
+              <Input
+                placeholder="Authorization: Bearer xxx"
+                onChange={(e) => set("webhook_headers", e.target.value)}
+              />
+            </Field>
+          </div>
         </div>
-        <div className="flex items-center gap-2 text-sm">
-          <Switch aria-labelledby="notify-login-label" checked={s.notify_login !== "off"} onCheckedChange={(v) => set("notify_login", v ? "on" : "off")} />
-          <span id="notify-login-label">登录后台时提醒</span>
-        </div>
+
         <div>
           <Button
             size="sm"
-            onClick={() =>
-              save({
-                notify_grace: text("notify_grace"),
-                notify_traffic: text("notify_traffic"),
-                notify_expiry: text("notify_expiry"),
+            onClick={() => {
+              const patch: Record<string, string> = {
+                notify_enabled: s.notify_enabled === "off" ? "off" : "on",
+                notify_node_up: s.notify_node_up === "off" ? "off" : "on",
+                notify_node_down: s.notify_node_down === "off" ? "off" : "on",
                 notify_login: s.notify_login === "off" ? "off" : "on",
-              })
-            }
+                pushplus_enabled: s.pushplus_enabled === "off" ? "off" : "on",
+                smtp_enabled: s.smtp_enabled === "off" ? "off" : "on",
+                telegram_enabled: s.telegram_enabled === "off" ? "off" : "on",
+                webhook_enabled: s.webhook_enabled === "off" ? "off" : "on",
+                pushplus_token: String(s.pushplus_token ?? ""),
+                telegram_chat: String(s.telegram_chat ?? ""),
+                smtp_host: String(s.smtp_host ?? ""),
+                smtp_port: String(s.smtp_port ?? ""),
+                smtp_username: String(s.smtp_username ?? ""),
+                smtp_from: String(s.smtp_from ?? ""),
+                smtp_to: String(s.smtp_to ?? ""),
+                smtp_security: String(s.smtp_security ?? "starttls"),
+              }
+              // 留空表示不变，不能把已存的凭据抹掉。
+              for (const key of ["smtp_password", "telegram_token", "webhook_url", "webhook_headers"]) {
+                const v = s[key]
+                if (typeof v === "string" && v) patch[key] = v
+              }
+              save(patch)
+            }}
           >
-            保存事件设置
+            保存通知设置
           </Button>
         </div>
       </Card>
@@ -1853,7 +1769,6 @@ function Data() {
 const ADMIN_SECTIONS = [
   { path: "/admin/nodes", label: "节点", icon: Server },
   { path: "/admin/ping", label: "延迟", icon: Radio },
-  { path: "/admin/notify", label: "通知", icon: Bell },
   { path: "/admin/data", label: "数据", icon: Database },
   { path: "/admin/themes", label: "主题", icon: Palette },
   { path: "/admin/security", label: "安全", icon: Shield },
@@ -1899,8 +1814,6 @@ export function Admin({
       <div className="min-w-0 flex-1">
         {path === "/admin/ping" ? (
           <Ping nodes={nodes} />
-        ) : path === "/admin/notify" ? (
-          <Notify nodes={nodes} refresh={refresh} />
         ) : path === "/admin/data" ? (
           <Data />
         ) : path === "/admin/themes" ? (

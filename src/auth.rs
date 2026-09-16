@@ -184,7 +184,6 @@ pub async fn login(
     app.throttle.clear(ip);
     match issue_session(&app, &headers) {
         Ok(cookie) => {
-            crate::notify::signed_in(&app, "应急密码", ip);
             with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -252,7 +251,7 @@ pub async fn github_callback(
     let Some(code) = query.code.as_deref().filter(|c| !c.is_empty()) else {
         return sign_in_failed(&app, &headers, "GitHub sent no authorization code");
     };
-    let user = match github_login(&app, code).await {
+    let _login = match github_login(&app, code).await {
         Ok(user) => user,
         Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
     };
@@ -260,7 +259,6 @@ pub async fn github_callback(
         Ok(cookie) => cookie,
         Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
     };
-    crate::notify::signed_in(&app, &format!("GitHub {user}"), client_ip(&headers, peer.ip()));
     with_cookies(Redirect::to("/admin"), [clear_state(&app, &headers), session])
 }
 

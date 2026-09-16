@@ -31,6 +31,10 @@ tower-http = { version = "0.6", features = ["limit", "compression-gzip"] }
 # tar.
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# SMTP notifications. tokio1-rustls + ring + webpki-roots keeps the dependency
+# tree pure-Rust so the release binary still builds with `cross` for scratch
+# images.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "tokio1-rustls", "ring", "webpki-roots", "hostname"] }
 
 [dev-dependencies]
 serde_urlencoded = "0.7"

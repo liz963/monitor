@@ -146,7 +146,6 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["ipv6"] = json!(node.ipv6);
         view["remark"] = json!(node.remark);
         view["token"] = json!(node.token);
-        view["notify"] = json!(node.notify);
     }
     view
 }
@@ -844,7 +843,9 @@ pub async fn delete_ping_task(_: Admin, State(app): State<Shared>, Path(id): Pat
 }
 
 /// Settings the panel may read. Secrets are deliberately excluded: the client can
-/// set the GitHub secret but never read it back.
+/// set the GitHub secret but never read it back, and the write-only credentials
+/// -- `smtp_password`, `telegram_token`, `webhook_url` and `webhook_headers` --
+/// are represented by their `*_set` boolean instead.
 const READABLE_SETTINGS: &[&str] = &[
     "site_name",
     "public_page",
@@ -853,6 +854,22 @@ const READABLE_SETTINGS: &[&str] = &[
     "retention_days",
     "theme",
     "github_proxy",
+    "notify_enabled",
+    "notify_node_up",
+    "notify_node_down",
+    "notify_login",
+    "pushplus_enabled",
+    "pushplus_token",
+    "smtp_enabled",
+    "smtp_host",
+    "smtp_port",
+    "smtp_username",
+    "smtp_from",
+    "smtp_to",
+    "smtp_security",
+    "telegram_enabled",
+    "telegram_chat",
+    "webhook_enabled",
 ];
 
 // ---- the database itself ----
@@ -1390,13 +1407,21 @@ pub async fn settings(_: Admin, State(app): State<Shared>) -> Json<Value> {
         "github_secret_set".into(),
         json!(app.db.get("github_client_secret").is_some_and(|v| !v.is_empty())),
     );
+    // The write-only credentials, reported to the panel only as set or unset.
+    for (key, public) in [
+        ("smtp_password", "smtp_password_set"),
+        ("telegram_token", "telegram_token_set"),
+        ("webhook_url", "webhook_url_set"),
+        ("webhook_headers", "webhook_headers_set"),
+    ] {
+        out.insert(public.into(), json!(app.db.get(key).is_some_and(|v| !v.is_empty())));
+    }
     // Read-only here. A window is opened and closed through its own route, so the
     // key is always one the hub generated, and `save_settings` continues to refuse
     // both names.
     for key in ["register_key", "register_until"] {
         out.insert(key.into(), json!(app.db.get(key).unwrap_or_default()));
     }
-    crate::notify::settings(&app, &mut out);
     Json(Value::Object(out))
 }
 
@@ -1434,7 +1459,26 @@ fn setting_error(app: &App, key: &str, value: &Value) -> Option<String> {
         }
         "admin_password" if value.len() < 12 => Some("password must be at least 12 characters".into()),
         "admin_password" => None,
-        k if k.starts_with("notify_") => crate::notify::setting_error(k, value),
+        // Notification switches take one of two literal values, matching how the
+        // UI stores them.
+        k @ ("notify_enabled" | "notify_node_up" | "notify_node_down" | "notify_login"
+            | "pushplus_enabled" | "smtp_enabled" | "telegram_enabled" | "webhook_enabled")
+            if !matches!(value, "on" | "off") =>
+        {
+            Some(format!("{k} must be on or off"))
+        }
+        "smtp_port" if !value.is_empty() && !value.parse::<u16>().is_ok() => {
+            Some("SMTP port must be a number from 1 to 65535".into())
+        }
+        "smtp_security" if !matches!(value, "tls" | "starttls" | "none" | "") => {
+            Some("SMTP security must be tls, starttls or none".into())
+        }
+        // An empty SMTP password is not an error: the save path skips it so the
+        // form can omit the field without wiping the stored secret.
+        "smtp_password" => None,
+        // A Telegram bot token, a chat id, a webhook URL and its header lines are
+        // shaped by the channel that uses them, so they are checked beside it.
+        k if k.starts_with("telegram_") || k.starts_with("webhook_") => crate::notify::setting_error(k, value),
         k if READABLE_SETTINGS.contains(&k) || k == "github_client_secret" => None,
         _ => Some(format!("unknown setting: {key}")),
     }
@@ -1468,6 +1512,13 @@ pub async fn save_settings(
                 Ok(cookie) => reissued = cookie,
                 Err(e) => return fail(e),
             }
+            continue;
+        }
+        // A write-only credential is stored but never read back; an omitted field
+        // in the form arrives as "" and must not erase what is already stored.
+        if value.is_empty()
+            && matches!(key.as_str(), "smtp_password" | "telegram_token" | "webhook_url" | "webhook_headers")
+        {
             continue;
         }
         if let Err(e) = app.db.set(key, value) {
@@ -2552,13 +2603,6 @@ mod tests {
             "retention_days": read["retention_days"],
             "github_proxy": read["github_proxy"],
             "public_page": "on",
-            "notify_grace": read["notify_grace"],
-            "notify_traffic": read["notify_traffic"],
-            "notify_expiry": read["notify_expiry"],
-            "notify_login": read["notify_login"],
-            "notify_telegram_chat": read["notify_telegram_chat"],
-            "notify_telegram_text": read["notify_telegram_text"],
-            "notify_webhook_body": read["notify_webhook_body"],
         });
         assert_eq!(
             save_settings(Admin, State(app.clone()), HeaderMap::new(), Json(echoed)).await.status(),
@@ -2569,21 +2613,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_never_hand_back_a_secret() {
+    async fn settings_never_hand_back_the_github_secret() {
         let app = app();
         app.db.set("github_client_secret", "super-secret").unwrap();
         app.db.set("github_client_id", "public-id").unwrap();
-        app.db.set("notify_telegram_token", "123:bot-secret").unwrap();
-        app.db.set("notify_webhook_url", "https://hooks.example/url-secret").unwrap();
-        app.db.set("notify_webhook_headers", "Authorization: header-secret").unwrap();
 
         let Json(body) = settings(Admin, axum::extract::State(std::sync::Arc::new(app))).await;
         assert_eq!(body["github_client_id"], "public-id");
         assert_eq!(body["github_secret_set"], true);
-        assert_eq!(body["notify_webhook_url_set"], true);
         assert!(body.get("github_client_secret").is_none());
-        for secret in ["super-secret", "bot-secret", "url-secret", "header-secret"] {
-            assert!(!body.to_string().contains(secret), "{secret}");
-        }
+        assert!(!body.to_string().contains("super-secret"));
     }
 }
