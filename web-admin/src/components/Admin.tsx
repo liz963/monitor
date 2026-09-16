@@ -1578,8 +1578,50 @@ function Sessions() {
 function Security({ site }: { site: string }) {
   const { s, set, save } = useSettings()
   const [password, setPassword] = useState("")
+  const [username, setUsername] = useState("")
+  const [accountPassword, setAccountPassword] = useState("")
+  const [accounts, setAccounts] = useState<{ id: number; username: string; created_at: number }[]>([])
+  const [logs, setLogs] = useState<{ ts: number; method: string; username: string; ip: string; device: string }[]>([])
+  const [busy, setBusy] = useState("")
   if (!s) return null
   const callback = `${site}/api/auth/github/callback`
+
+  const loadAccounts = () =>
+    api<{ id: number; username: string; created_at: number }[]>("/accounts").then(setAccounts).catch((e: Error) => toast.error(e.message))
+  const loadLogs = () =>
+    api<{ ts: number; method: string; username: string; ip: string; device: string }[]>("/login-logs").then(setLogs).catch(() => {})
+  useEffect(() => {
+    loadAccounts()
+    loadLogs()
+  }, [])
+
+  async function createAccount() {
+    setBusy("create")
+    try {
+      await api("/accounts", { method: "POST", body: JSON.stringify({ username, password: accountPassword }) })
+      toast.success("账号已创建，登录页现在可切换账号密码登录")
+      setUsername("")
+      setAccountPassword("")
+      loadAccounts()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy("")
+    }
+  }
+
+  async function removeAccount(id: number) {
+    setBusy(String(id))
+    try {
+      await api(`/accounts/${id}`, { method: "DELETE" })
+      toast.success("账号已删除")
+      loadAccounts()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setBusy("")
+    }
+  }
 
   return (
     <div className="space-y-4">
@@ -1647,8 +1689,91 @@ function Security({ site }: { site: string }) {
           </Button>
         </div>
       </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">账号密码登录</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            创建账号后，登录页会出现「账号密码」切换按钮；删除账号后其密码立即失效。
+          </p>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
+          <Field label="用户名">
+            <Input
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="3-32 位字母数字 _ - ."
+              autoComplete="off"
+            />
+          </Field>
+          <Field label="密码" hint="至少 12 位">
+            <Input
+              type="password"
+              value={accountPassword}
+              onChange={(e) => setAccountPassword(e.target.value)}
+              autoComplete="new-password"
+            />
+          </Field>
+          <Button
+            size="sm"
+            disabled={busy === "create" || username.trim().length < 3 || accountPassword.length < 12}
+            onClick={createAccount}
+          >
+            创建账号
+          </Button>
+        </div>
+        {accounts.length > 0 && (
+          <div className="divide-y">
+            {accounts.map((a) => (
+              <div key={a.id} className="flex items-center justify-between gap-3 py-2.5 first:pt-0 last:pb-0">
+                <div className="min-w-0 text-sm">
+                  <span className="font-medium">{a.username}</span>
+                  <span className="tnum ml-2 text-xs text-muted-foreground">
+                    {new Date(a.created_at * 1000).toLocaleString()}
+                  </span>
+                </div>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  disabled={!!busy}
+                  onClick={() => removeAccount(a.id)}
+                  title="删除账号"
+                  aria-label="删除账号"
+                >
+                  <Trash2 />
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      <Card className="gap-4 p-5">
+        <div>
+          <h3 className="text-sm font-medium">登录记录</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            每次成功登录一条：时间、方式、账号、IP、设备。仅作审计，不可删除。
+          </p>
+        </div>
+        <div className="divide-y">
+          {logs.length === 0 && <p className="text-sm text-muted-foreground">暂无记录</p>}
+          {logs.map((l, i) => (
+            <div key={i} className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-sm first:pt-0 last:pb-0">
+              <span className="tnum">{new Date(l.ts * 1000).toLocaleString()}</span>
+              <Badge variant="secondary">{methodLabel(l.method)}</Badge>
+              <span className="text-muted-foreground">{l.username}</span>
+              <span className="tnum text-muted-foreground">{l.ip}</span>
+              <span className="text-xs text-muted-foreground">{l.device}</span>
+            </div>
+          ))}
+        </div>
+      </Card>
     </div>
   )
+}
+
+function methodLabel(method: string) {
+  return method === "password" ? "应急密码" : method === "account" ? "账号密码" : method === "github" ? "GitHub" : method
 }
 
 type DbInfo = {

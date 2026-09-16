@@ -405,6 +405,10 @@ async fn main() -> Result<()> {
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))
         .route("/api/sessions", get(api::sessions))
         .route("/api/sessions/{id}", delete(api::delete_session))
+        // Password accounts and the login audit trail.
+        .route("/api/accounts", get(api::accounts).post(api::create_account))
+        .route("/api/accounts/{id}", delete(api::delete_account))
+        .route("/api/login-logs", get(api::login_logs))
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))

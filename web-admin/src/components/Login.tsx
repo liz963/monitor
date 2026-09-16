@@ -25,7 +25,19 @@ function callbackError(): string {
   return reason ?? ""
 }
 
-export function Login({ github, onDone }: { github: boolean; onDone: () => void }) {
+type Mode = "password" | "account"
+
+export function Login({
+  github,
+  accountLogin,
+  onDone,
+}: {
+  github: boolean
+  accountLogin: boolean
+  onDone: () => void
+}) {
+  const [mode, setMode] = useState<Mode>("password")
+  const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
   const [error, setError] = useState(callbackError)
   const [busy, setBusy] = useState(false)
@@ -35,7 +47,9 @@ export function Login({ github, onDone }: { github: boolean; onDone: () => void 
     setBusy(true)
     setError("")
     try {
-      await api("/auth/login", { method: "POST", body: JSON.stringify({ password }) })
+      const body =
+        mode === "account" ? JSON.stringify({ username, password }) : JSON.stringify({ password })
+      await api("/auth/login", { method: "POST", body })
       onDone()
     } catch (err) {
       setError((err as Error).message)
@@ -63,25 +77,65 @@ export function Login({ github, onDone }: { github: boolean; onDone: () => void 
             <div className="relative">
               <Separator />
               <span className="absolute inset-0 -top-2 mx-auto w-fit bg-card px-2 text-xs text-muted-foreground">
-                或使用应急密码
+                或使用密码
               </span>
             </div>
           </>
         )}
 
+        {/* The emergency password is always the default. Once a password account
+            exists the page offers a switch between the two password modes. */}
+        {accountLogin && (
+          <div className="grid grid-cols-2 gap-1 rounded-lg bg-muted p-1 text-sm">
+            {(["password", "account"] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => {
+                  setMode(m)
+                  setError("")
+                }}
+                className={`rounded-md px-3 py-1.5 ${
+                  mode === m ? "bg-background font-medium shadow-sm" : "text-muted-foreground"
+                }`}
+              >
+                {m === "password" ? "应急密码" : "账号密码"}
+              </button>
+            ))}
+          </div>
+        )}
+
         <form onSubmit={submit} className="space-y-3">
+          {mode === "account" && (
+            <div className="space-y-1.5">
+              <Label htmlFor="username" className="text-xs">账号</Label>
+              <Input
+                id="username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                autoComplete="username"
+                autoFocus
+              />
+            </div>
+          )}
           <div className="space-y-1.5">
-            <Label htmlFor="password" className="text-xs">应急密码</Label>
+            <Label htmlFor="password" className="text-xs">
+              {mode === "password" ? "应急密码" : "密码"}
+            </Label>
             <Input
               id="password"
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               autoComplete="current-password"
-              autoFocus={!github}
+              autoFocus={!accountLogin && !github}
             />
           </div>
-          <Button type="submit" className="w-full" disabled={busy || !password}>
+          <Button
+            type="submit"
+            className="w-full"
+            disabled={busy || !password || (mode === "account" && !username)}
+          >
             登录
           </Button>
         </form>

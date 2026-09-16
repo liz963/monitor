@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
+use crate::notify;
 use crate::App;
 
 pub const COOKIE: &str = "monitor_session";
@@ -158,6 +159,10 @@ pub fn issue_session(app: &App, headers: &HeaderMap) -> Result<String> {
 #[derive(Deserialize)]
 pub struct LoginBody {
     password: String,
+    /// Absent or empty: the emergency password. Present: the matching password
+    /// account. The sign-in page sends one or the other.
+    #[serde(default)]
+    username: Option<String>,
 }
 
 pub async fn login(
@@ -174,20 +179,55 @@ pub async fn login(
     let Ok(_permit) = PASSWORD_GATE.try_acquire() else {
         return (StatusCode::TOO_MANY_REQUESTS, "too many attempts, try again later").into_response();
     };
-    let Some(stored) = app.db.get("admin_password_hash") else {
-        return (StatusCode::FORBIDDEN, "password login is disabled").into_response();
-    };
-    if !verify_password(&body.password, &stored) {
-        app.throttle.record_failure(ip);
-        return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
-    }
-    app.throttle.clear(ip);
-    match issue_session(&app, &headers) {
-        Ok(cookie) => {
-            with_cookies(Json(serde_json::json!({"ok": true})), [cookie])
+    // One failure message for both an unknown account and a wrong password:
+    // distinguishing them hands out a list of valid usernames.
+    let (method, username) = match body.username.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        Some(name) => {
+            let Some(stored) = app.db.account_hash(name) else {
+                app.throttle.record_failure(ip);
+                return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response();
+            };
+            if !verify_password(&body.password, &stored) {
+                app.throttle.record_failure(ip);
+                return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response();
+            }
+            ("account", name.to_owned())
         }
+        None => {
+            let Some(stored) = app.db.get("admin_password_hash") else {
+                return (StatusCode::FORBIDDEN, "password login is disabled").into_response();
+            };
+            if !verify_password(&body.password, &stored) {
+                app.throttle.record_failure(ip);
+                return (StatusCode::UNAUTHORIZED, "invalid password").into_response();
+            }
+            ("password", "admin".into())
+        }
+    };
+    app.throttle.clear(ip);
+    audit_login(&app, &headers, ip, method, &username);
+    match issue_session(&app, &headers) {
+        Ok(cookie) => with_cookies(Json(serde_json::json!({"ok": true})), [cookie]),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// Records a successful sign-in in the audit trail and, when configured, sends
+/// the login notification. Fire-and-forget on the notification: a slow channel
+/// must not hold up the response that completes the sign-in.
+fn audit_login(app: &crate::Shared, headers: &HeaderMap, ip: IpAddr, method: &str, username: &str) {
+    let device =
+        notify::device_from_user_agent(headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()));
+    let ip = ip.to_string();
+    let username = username.to_owned();
+    let method = method.to_owned();
+    if let Err(e) = app.db.insert_login_log(&method, &username, &ip, &device) {
+        warn!("recording login failed: {e:#}");
+    }
+    let app = app.clone();
+    tokio::spawn(async move {
+        notify::login_notice(&app, &method, &username, &ip, &device).await;
+    });
 }
 
 pub async fn logout(State(app): State<crate::Shared>, headers: HeaderMap) -> Response {
@@ -251,10 +291,12 @@ pub async fn github_callback(
     let Some(code) = query.code.as_deref().filter(|c| !c.is_empty()) else {
         return sign_in_failed(&app, &headers, "GitHub sent no authorization code");
     };
-    let _login = match github_login(&app, code).await {
-        Ok(user) => user,
+    let login = match github_login(&app, code).await {
+        Ok(login) => login,
         Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
     };
+    let ip = client_ip(&headers, peer.ip());
+    audit_login(&app, &headers, ip, "github", &login);
     let session = match issue_session(&app, &headers) {
         Ok(cookie) => cookie,
         Err(e) => return sign_in_failed(&app, &headers, &e.to_string()),
@@ -307,8 +349,8 @@ fn urlencode(value: &str) -> String {
         .collect()
 }
 
-/// Exchanges the code for a token and checks the login against the allow list,
-/// returning the accepted login.
+/// Exchanges the code for a token, checks the login against the allow list, and
+/// returns the GitHub login on success — the identity the audit trail records.
 async fn github_login(app: &App, code: &str) -> Result<String> {
     let (Some(id), Some(secret)) = (app.db.get("github_client_id"), app.db.get("github_client_secret"))
     else {

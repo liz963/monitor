@@ -128,12 +128,28 @@ CREATE TABLE IF NOT EXISTS session (
   token_hash TEXT    PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS account (
+  id            INTEGER PRIMARY KEY,
+  username      TEXT    NOT NULL UNIQUE,
+  password_hash TEXT    NOT NULL,
+  created_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS login_log (
+  id         INTEGER PRIMARY KEY,
+  ts         INTEGER NOT NULL,
+  method     TEXT    NOT NULL,
+  username   TEXT    NOT NULL,
+  ip         TEXT    NOT NULL,
+  device     TEXT    NOT NULL
+);
 "#;
 
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -247,6 +263,28 @@ fn migrate_to_5(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "komari_token TEXT UNIQUE")
 }
 
+/// Password accounts for the sign-in page and the login audit trail. Both are
+/// new tables, so `CREATE TABLE IF NOT EXISTS` is all a migration needs.
+fn migrate_to_6(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account (
+           id            INTEGER PRIMARY KEY,
+           username      TEXT    NOT NULL UNIQUE,
+           password_hash TEXT    NOT NULL,
+           created_at    INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS login_log (
+           id         INTEGER PRIMARY KEY,
+           ts         INTEGER NOT NULL,
+           method     TEXT    NOT NULL,
+           username   TEXT    NOT NULL,
+           ip         TEXT    NOT NULL,
+           device     TEXT    NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -269,13 +307,26 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     if from < 5 {
         migrate_to_5(conn)?;
     }
+    if from < 6 {
+        migrate_to_6(conn)?;
+    }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
 }
 
 /// Every table a backup must carry before this build will restore it.
-const TABLES: [&str; 8] =
-    ["setting", "node", "traffic", "metric", "ping_task", "ping_node", "ping_record", "session"];
+const TABLES: [&str; 10] = [
+    "setting",
+    "node",
+    "traffic",
+    "metric",
+    "ping_task",
+    "ping_node",
+    "ping_record",
+    "session",
+    "account",
+    "login_log",
+];
 
 /// One node's stored configuration and last known facts.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -485,6 +536,10 @@ const PING_ROWS: &str = "SELECT ts/?3, task_id, latency FROM ping_record
      WHERE node_id=?1 AND ts>=?2
            AND task_id IN (SELECT task_id FROM ping_node WHERE node_id=?1)
      ORDER BY ts";
+
+/// One row of the login audit trail: when, how, who, from where, on what. Named
+/// so the reader of a signature does not have to count fields in a tuple.
+pub type LoginLog = (i64, String, String, String, String);
 
 impl Db {
     pub fn open(path: &str) -> Result<Self> {
@@ -1522,6 +1577,71 @@ impl Db {
     pub fn expire_sessions(&self) -> Result<()> {
         self.conn().execute("DELETE FROM session WHERE expires_at <= ?1", [Utc::now().timestamp()])?;
         Ok(())
+    }
+
+    // ---- password accounts ----
+
+    /// Whether any password account exists. The sign-in page switches to
+    /// username/password mode only when one does.
+    pub fn account_exists(&self) -> bool {
+        self.conn()
+            .query_row("SELECT 1 FROM account LIMIT 1", [], |_| Ok(()))
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// The stored hash for one username, if the account exists.
+    pub fn account_hash(&self, username: &str) -> Option<String> {
+        self.conn()
+            .query_row("SELECT password_hash FROM account WHERE username = ?1", [username], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn accounts(&self) -> Result<Vec<(i64, String, i64)>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, username, created_at FROM account ORDER BY id")?;
+        let rows =
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn create_account(&self, username: &str, password_hash: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO account (username, password_hash, created_at) VALUES (?1, ?2, ?3)",
+            params![username, password_hash, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_account(&self, id: i64) -> Result<()> {
+        self.conn().execute("DELETE FROM account WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    // ---- login audit trail ----
+
+    pub fn insert_login_log(&self, method: &str, username: &str, ip: &str, device: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO login_log (ts, method, username, ip, device) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![Utc::now().timestamp(), method, username, ip, device],
+        )?;
+        Ok(())
+    }
+
+    /// Login events, newest first. Bounded: the trail is an audit aid, not a
+    /// datastore, and the table is never pruned.
+    pub fn login_logs(&self, limit: i64) -> Result<Vec<LoginLog>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT ts, method, username, ip, device FROM login_log ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt
+            .query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 }
 

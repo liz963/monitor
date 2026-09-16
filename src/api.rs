@@ -515,6 +515,8 @@ pub async fn me(State(app): State<Shared>, headers: HeaderMap) -> Json<Value> {
     Json(json!({
         "authed": authed(&app, &headers),
         "github": app.db.get("github_client_id").is_some_and(|v| !v.is_empty()),
+        // Whether the sign-in page may offer username/password mode.
+        "account_login": app.db.account_exists(),
         "site_name": app.db.get("site_name").unwrap_or_else(|| "Monitor".into()),
         "public_page": app.public_page(),
         "can_provision": provisioning_allowed(&app, &headers),
@@ -1565,6 +1567,79 @@ pub async fn save_settings(
         }
     }
     with_cookies(Json(json!({"ok": true})), [reissued])
+}
+
+// ---- password accounts and the login audit trail ----
+
+/// Usernames are trimmed, lowercased and bounded, so the sign-in lookup cannot
+/// be handed a wildcard or a 10 MB name.
+fn valid_username(name: &str) -> Option<String> {
+    let name = name.trim().to_lowercase();
+    if (3..=32).contains(&name.chars().count())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Creates a password account. The password rides the same argon2 path as the
+/// emergency password, including its minimum length.
+pub async fn create_account(
+    _: Admin,
+    State(app): State<Shared>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let Some(username) = body.get("username").and_then(|v| v.as_str()).and_then(valid_username) else {
+        return bad("username must be 3-32 characters: letters, digits, _ - .");
+    };
+    let Some(password) = body.get("password").and_then(|v| v.as_str()) else {
+        return bad("password is required");
+    };
+    if password.len() < 12 {
+        return bad("password must be at least 12 characters");
+    }
+    match hash_password(password).and_then(|h| app.db.create_account(&username, &h)) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) if e.to_string().contains("UNIQUE") => bad("username already exists"),
+        Err(e) => fail(e),
+    }
+}
+
+pub async fn accounts(_: Admin, State(app): State<Shared>) -> Json<Value> {
+    let rows = app.db.accounts().unwrap_or_default();
+    Json(json!(rows
+        .into_iter()
+        .map(|(id, username, created_at)| json!({"id": id, "username": username, "created_at": created_at}))
+        .collect::<Vec<_>>()))
+}
+
+pub async fn delete_account(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    match app.db.delete_account(id) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// The login audit trail, newest first. The default is enough rows to spot a
+/// pattern without drowning the page.
+pub async fn login_logs(
+    _: Admin,
+    State(app): State<Shared>,
+    Query(query): Query<serde_json::Value>,
+) -> Json<Value> {
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let rows = app.db.login_logs(limit).unwrap_or_default();
+    Json(json!(rows
+        .into_iter()
+        .map(|(ts, method, username, ip, device)| json!({"ts": ts, "method": method, "username": username, "ip": ip, "device": device}))
+        .collect::<Vec<_>>()))
 }
 
 #[cfg(test)]
