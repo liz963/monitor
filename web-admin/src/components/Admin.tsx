@@ -1583,17 +1583,19 @@ function Security({ site }: { site: string }) {
   const [accounts, setAccounts] = useState<{ id: number; username: string; created_at: number }[]>([])
   const [logs, setLogs] = useState<{ ts: number; method: string; username: string; ip: string; device: string }[]>([])
   const [busy, setBusy] = useState("")
-  if (!s) return null
-  const callback = `${site}/api/auth/github/callback`
-
   const loadAccounts = () =>
     api<{ id: number; username: string; created_at: number }[]>("/accounts").then(setAccounts).catch((e: Error) => toast.error(e.message))
   const loadLogs = () =>
     api<{ ts: number; method: string; username: string; ip: string; device: string }[]>("/login-logs").then(setLogs).catch(() => {})
+  // Above the early return below, not after it: a hook reached on only some
+  // render paths changes the hook count between renders, which React refuses.
   useEffect(() => {
     loadAccounts()
     loadLogs()
   }, [])
+
+  if (!s) return null
+  const callback = `${site}/api/auth/github/callback`
 
   async function createAccount() {
     setBusy("create")
