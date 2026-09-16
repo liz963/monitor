@@ -2,8 +2,8 @@
 
 自托管服务器监控：一个 hub（axum + SQLite）加一个轻量 agent，秒级实时数据、公开状态页与后台。
 
-本仓库是 [monitor-probe/monitor](https://github.com/monitor-probe/monitor) 的分支，分叉点是
-`4c53204`（写这份说明时上游 `main` 仍是这个提交），本仓库在它之上继续开发。
+本仓库是 [monitor-probe/monitor](https://github.com/monitor-probe/monitor) 的 fork，分叉点是
+`4c53204`（写这份说明时上游 `main` 仍是这个提交），在它之上继续开发。
 
 ## 特性
 
