@@ -222,7 +222,6 @@ User=$USER_NAME
 WorkingDirectory=$ROOT
 ReadWritePaths=$DATA
 NoNewPrivileges=yes
-# The hub creates no setuid/setgid file either, so the constraint costs nothing.
 RestrictSUIDSGID=yes
 ProtectSystem=strict
 ProtectHome=yes
