@@ -11,7 +11,7 @@
 - 轻量高效：Rust 语言构建，低资源占用，极简高效
 - 自托管：完全掌控数据隐私，部署简单
 - 通知：节点上下线、后台登录时推送，渠道可选 PushPlus、SMTP、Telegram 与 Webhook
-- 兼容 komari-agent：已装的 komari-agent 换个 token 即可接入，无需改动
+- 兼容 komari-agent：已装的 komari-agent 在 Hub 添加节点输入原有 token 即可接入，无需改动
 
 ## 与上游的差异
 
