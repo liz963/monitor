@@ -17,6 +17,7 @@ use crate::auth::{
     authed, client_ip, current_session, hash_password, issue_session, issued_at, random_token, with_cookies,
 };
 use crate::db::{Node, NodePatch, PingTask, Traffic, TrafficPatch};
+use crate::komari_compat;
 use crate::{agent_ws, App, Shared};
 
 /// Present only on requests carrying a valid session. Handlers taking it cannot
@@ -112,6 +113,11 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         "swap_total": live("swap_total", node.swap_total),
         "disk_total": live("disk_total", node.disk_total),
         "agent_version": node.agent_version,
+        // Which protocol the node currently speaks: the session's, or the
+        // configuration when no session is live. The panel labels Native and
+        // Komari agents differently.
+        "agent_protocol": current.map(|a| if a.komari { "komari" } else { "native" })
+            .unwrap_or(if node.komari_token.is_empty() { "native" } else { "komari" }),
         "price": node.price,
         "currency": node.currency,
         "billing_cycle": node.billing_cycle,
@@ -146,6 +152,10 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         view["ipv6"] = json!(node.ipv6);
         view["remark"] = json!(node.remark);
         view["token"] = json!(node.token);
+        // The komari credential and whether compatibility is on (i.e. a token
+        // is set), for the panel's komari controls.
+        view["komari_token"] = json!(node.komari_token);
+        view["komari_enabled"] = json!(!node.komari_token.is_empty());
     }
     view
 }
@@ -535,6 +545,9 @@ pub async fn create_node(
     {
         return bad(message);
     }
+    if !node.komari_token.is_empty() && !komari_compat::valid_komari_token(&node.komari_token) {
+        return bad("komari token must be 8-128 alphanumeric characters");
+    }
     node.name = node.name.trim().to_owned();
     let token = random_token();
     match app.db.create_node(&node, &token) {
@@ -675,6 +688,13 @@ pub async fn update_node(
     if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
         return bad(message);
     }
+    // An explicit empty string means "clear the token", i.e. disable komari;
+    // only a non-empty token must pass the format check.
+    if node.komari_token.as_ref().is_some_and(|v| {
+        v.as_deref().is_some_and(|komari| !komari.is_empty() && !komari_compat::valid_komari_token(komari))
+    }) {
+        return bad("komari token must be 8-128 alphanumeric characters");
+    }
     match app.db.update_node(id, &node) {
         Ok(()) => {
             invalidate_snapshot(&app);
@@ -741,6 +761,25 @@ pub async fn reset_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64
         // The token alone: the panel builds the command, and one place needs to
         // know its form.
         Ok(()) => Json(json!({"token": token})).into_response(),
+        Err(e) => fail(e),
+    }
+}
+
+/// Issues a fresh komari credential, invalidating the old one immediately.
+/// Unlike the native token there is no install command to display; the token
+/// is copied into the existing komari-agent's configuration, which reconnects
+/// with it.
+pub async fn reset_komari_token(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    if app.db.node(id).map(|n| n.is_none()).unwrap_or(true) {
+        return (StatusCode::NOT_FOUND, "no such node").into_response();
+    }
+    let token = crate::komari_compat::generate_komari_token();
+    // A session already open with the old credential would keep reporting;
+    // dropping the sender ends it, and the agent reconnects with the new token.
+    app.agents.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    invalidate_snapshot(&app);
+    match app.db.set_komari_token(id, &token) {
+        Ok(()) => Json(json!({"komari_token": token})).into_response(),
         Err(e) => fail(e),
     }
 }
@@ -1799,7 +1838,7 @@ mod tests {
     /// for.
     fn connect(app: &App, id: i64, metrics: Value) -> tokio::sync::mpsc::Receiver<String> {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let mut agent = crate::agent_ws::Agent::new(7, tx);
+        let mut agent = crate::agent_ws::Agent::new(7, tx, false);
         agent.metrics = metrics;
         agent.last_seen = Utc::now().timestamp();
         app.agents.write().unwrap().insert(id, agent);

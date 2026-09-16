@@ -3,15 +3,17 @@
 //! first, with self-describing frames readable via curl or a browser console.
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
@@ -19,6 +21,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::auth::client_ip;
+use crate::komari_compat;
 use crate::{App, Shared};
 
 /// How often a quiet agent is probed, and how long the hub waits for any frame
@@ -66,10 +69,14 @@ pub struct Agent {
     pub mark: Option<(Instant, i64, i64)>,
     /// Running mean of the minute in progress, for the same reason.
     minute: Minute,
+    /// Whether this session speaks the komari protocol. The panel labels a node
+    /// by the protocol of its current session, and falls back to its
+    /// configuration when no session is live.
+    pub komari: bool,
 }
 
 impl Agent {
-    pub fn new(session: u64, tx: mpsc::Sender<String>) -> Self {
+    pub fn new(session: u64, tx: mpsc::Sender<String>, komari: bool) -> Self {
         Self {
             session,
             tx,
@@ -82,6 +89,7 @@ impl Agent {
             last_minute: Utc::now().timestamp() / 60,
             mark: None,
             minute: Minute::default(),
+            komari,
         }
     }
 }
@@ -135,6 +143,9 @@ struct Rpc {
     method: String,
     #[serde(default)]
     params: serde_json::Value,
+    /// Echoed back in the JSON-RPC response; a notification carries `null`.
+    #[serde(default)]
+    id: serde_json::Value,
 }
 
 pub async fn handler(
@@ -154,11 +165,50 @@ pub async fn handler(
 
     upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
         move |socket| async move {
-            if let Err(e) = serve(app, node_id, ip, socket).await {
+            if let Err(e) = serve(app, node_id, ip, socket, false).await {
                 debug!("node {node_id} disconnected: {e:#}");
             }
         },
     )
+}
+
+/// The WebSocket endpoint a komari-agent connects to:
+/// `GET /api/clients/v2/rpc?token=XXX`. The token comes from the query string
+/// first and the `Authorization: Bearer` header second, and is looked up only
+/// in `hosts.komari_token` -- the native token is never consulted here, so the
+/// two agent families remain fully isolated. The connection is then served by
+/// the same session machinery as a native agent, with a komari-specific
+/// dispatcher and no native probe push.
+pub async fn komari_ws_handler(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(token) = komari_token(&query, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "missing token").into_response();
+    };
+    let Ok(Some(node_id)) = app.db.find_host_by_komari_token(token) else {
+        warn!("komari agent refused: no host carries this komari token");
+        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+    };
+    let ip = client_ip(&headers, peer.ip()).to_string();
+
+    upgrade.read_buffer_size(crate::api::SOCKET_BUFFER).max_message_size(crate::api::MAX_FRAME).on_upgrade(
+        move |socket| async move {
+            if let Err(e) = serve(app, node_id, ip, socket, true).await {
+                debug!("node {node_id} komari session disconnected: {e:#}");
+            }
+        },
+    )
+}
+
+/// A komari credential as presented by the agent: query parameter first,
+/// `Authorization: Bearer` header second. komari's own agent only sends the
+/// query form; the header is accepted for proxies that strip query strings.
+fn komari_token<'a>(query: &'a HashMap<String, String>, headers: &'a HeaderMap) -> Option<&'a str> {
+    query.get("token").map(String::as_str).filter(|t| !t.is_empty()).or_else(|| bearer(headers))
 }
 
 /// Extracts the node token from `Authorization: Bearer <token>`.
@@ -166,17 +216,133 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ").filter(|t| !t.is_empty())
 }
 
-async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> Result<()> {
+/// One JSON-RPC response for a komari POST request. The agent expects a
+/// standard JSON-RPC envelope on success; unknown methods also receive one, so
+/// a channel the hub does not act on (e.g. `agent.pull` during POST fallback)
+/// is not mistaken for a broken connection.
+fn komari_ok(id: &serde_json::Value) -> Response {
+    Json(json!({"jsonrpc": "2.0", "id": id, "result": {"status": "success", "events": []}})).into_response()
+}
+
+/// The HTTP POST endpoint a komari-agent falls back to, and the only channel
+/// it uploads `agent.basicInfo` through. Body may be gzip-compressed. Reports
+/// arriving here are served without a live session: traffic accumulates, a
+/// metric row is written and the node is marked seen, exactly as a WebSocket
+/// report would, minus the per-minute averaging that a session owns.
+pub async fn komari_post_handler(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(token) = komari_token(&query, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "missing token").into_response();
+    };
+    let Ok(Some(node_id)) = app.db.find_host_by_komari_token(token) else {
+        warn!("komari agent refused: no host carries this komari token");
+        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+    };
+    let Some(raw) = maybe_decompress(&headers, &body) else {
+        return (StatusCode::BAD_REQUEST, "invalid gzip body").into_response();
+    };
+    let Ok(text) = std::str::from_utf8(&raw) else {
+        return (StatusCode::BAD_REQUEST, "body is not UTF-8").into_response();
+    };
+    let Ok(rpc) = serde_json::from_str::<Rpc>(text) else {
+        return (StatusCode::BAD_REQUEST, "parse error").into_response();
+    };
+    let ip = client_ip(&headers, peer.ip()).to_string();
+    match rpc.method.as_str() {
+        komari_compat::METHOD_REPORT => {
+            let report = rpc.params.get("report").cloned().unwrap_or(serde_json::Value::Null);
+            match post_report(&app, node_id, &komari_compat::convert_komari_report(&report)) {
+                Ok(()) => komari_ok(&rpc.id),
+                Err(e) => {
+                    warn!("node {node_id} sent an unusable komari report: {e:#}");
+                    (StatusCode::BAD_REQUEST, "invalid report").into_response()
+                }
+            }
+        }
+        komari_compat::METHOD_BASIC_INFO => {
+            let info = rpc.params.get("info").cloned().unwrap_or(serde_json::Value::Null);
+            match app.db.save_facts(node_id, &komari_compat::convert_komari_basic_info(&info), &ip) {
+                Ok(_) => komari_ok(&rpc.id),
+                Err(e) => fail(&e),
+            }
+        }
+        // pingResult / taskResult / event / pull and anything else: nothing to
+        // do yet, but the agent must not treat the channel as broken.
+        _ => komari_ok(&rpc.id),
+    }
+}
+
+fn fail(e: &anyhow::Error) -> Response {
+    warn!("komari POST failed: {e:#}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+}
+
+/// Decompresses a gzip request body when the header asks for it; otherwise
+/// returns the body unchanged. The komari agent compresses POST bodies by
+/// default.
+fn maybe_decompress(headers: &HeaderMap, body: &[u8]) -> Option<Vec<u8>> {
+    let gzipped = headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("gzip"));
+    if !gzipped {
+        return Some(body.to_vec());
+    }
+    let mut decoder = flate2::read::GzDecoder::new(body);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok().map(|_| out)
+}
+
+/// Files one komari report that arrived over HTTP, with no live session behind
+/// it. `report` is the converted native metrics object. The per-minute mean is
+/// a session-owned quantity, so the row carries the instantaneous readings;
+/// traffic and the node's last-seen are updated exactly as for a WebSocket
+/// report. If a session happens to be live (WS connected alongside POST
+/// fallback), its live view is refreshed too.
+fn post_report(app: &App, node_id: i64, metrics: &serde_json::Value) -> Result<()> {
+    let now = Utc::now().timestamp();
+    let counter = |k: &str| metrics.get(k).and_then(|v| v.as_i64()).filter(|n| *n >= 0);
+    let counters = counter("net_rx_total").zip(counter("net_tx_total"));
+    let traffic = app.db.accumulate(node_id, komari_compat::KOMARI_BOOT_ID, counters)?;
+
+    let mut row = metrics.clone();
+    if let Some(obj) = row.as_object_mut() {
+        obj.insert("total_rx".into(), json!(traffic.total_rx));
+        obj.insert("total_tx".into(), json!(traffic.total_tx));
+        obj.insert("month_rx".into(), json!(traffic.month_rx));
+        obj.insert("month_tx".into(), json!(traffic.month_tx));
+    }
+    app.db.insert_metric(node_id, now / 60 * 60, &row)?;
+    app.db.touch_seen(node_id, now)?;
+
+    let mut agents = app.agents.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = agents.get_mut(&node_id) {
+        entry.metrics = metrics.clone();
+        entry.last_seen = now;
+    }
+    Ok(())
+}
+
+async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket, komari: bool) -> Result<()> {
     let (tx, mut rx) = mpsc::channel::<String>(16);
     let session = SESSION.fetch_add(1, Ordering::Relaxed);
     // Online from the handshake rather than the first report: a panel reporting
     // otherwise for a whole interval would describe the hub's bookkeeping rather
     // than the machine.
-    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx));
-    info!("node {node_id} connected from {ip}");
+    app.agents.write().unwrap_or_else(|e| e.into_inner()).insert(node_id, Agent::new(session, tx, komari));
+    info!("node {node_id} {}connected from {ip}", if komari { "komari " } else { "" });
 
-    // Send the probe list before the first report arrives.
-    let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
+    // Send the probe list before the first report arrives. A komari-agent
+    // speaks its own protocol and would ignore this frame, so it is skipped on
+    // that path.
+    if !komari {
+        let _ = socket.send(Message::Text(ping_tasks_message(&app, node_id).into())).await;
+    }
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // The first tick completes immediately.
@@ -209,7 +375,9 @@ async fn serve(app: Shared, node_id: i64, ip: String, mut socket: WebSocket) -> 
                 // of the runtime -- the panel, the public page, the shutdown
                 // signal.
                 Some(Ok(Message::Text(text))) =>
-                    match tokio::task::block_in_place(|| dispatch(&app, node_id, &ip, &text)) {
+                    match tokio::task::block_in_place(|| {
+                        if komari { komari_dispatch(&app, node_id, &ip, &text) } else { dispatch(&app, node_id, &ip, &text) }
+                    }) {
                     Ok(true) => locate(app.clone(), node_id, ip.clone()),
                     Ok(false) => {}
                     Err(e) => warn!("node {node_id} sent an unusable message: {e:#}"),
@@ -263,6 +431,35 @@ fn dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
             }
         }
         other => debug!("node {node_id} sent unknown method {other}"),
+    }
+    Ok(false)
+}
+
+/// Handles one inbound frame from a komari-agent. `agent.report` is converted
+/// and filed through the native pipeline (which owns validation, traffic
+/// accumulation, minute averaging and the live view); `agent.basicInfo` updates
+/// the stored host facts. The remaining methods are logged and ignored, as the
+/// compat plan intends until ping/exec results are implemented.
+fn komari_dispatch(app: &App, node_id: i64, ip: &str, text: &str) -> Result<bool> {
+    let rpc: Rpc = serde_json::from_str(text)?;
+    match rpc.method.as_str() {
+        komari_compat::METHOD_REPORT => {
+            let payload = rpc.params.get("report").cloned().unwrap_or(serde_json::Value::Null);
+            report(app, node_id, komari_compat::convert_komari_report(&payload))?;
+        }
+        komari_compat::METHOD_BASIC_INFO => {
+            let info = rpc.params.get("info").cloned().unwrap_or(serde_json::Value::Null);
+            app.db.save_facts(node_id, &komari_compat::convert_komari_basic_info(&info), ip)?;
+        }
+        // Ping and exec results, and events: nothing consumes them yet, but a
+        // distinct log line keeps the gap visible while the compat plan fills
+        // it in.
+        komari_compat::METHOD_PING_RESULT
+        | komari_compat::METHOD_TASK_RESULT
+        | komari_compat::METHOD_EVENT => {
+            debug!("node {node_id} sent komari {}; ignored for now", rpc.method)
+        }
+        other => debug!("node {node_id} sent ignored komari method {other}"),
     }
     Ok(false)
 }
@@ -498,7 +695,7 @@ mod tests {
     fn connect(app: &App) -> (i64, mpsc::Receiver<String>) {
         let id = node(app);
         let (tx, rx) = mpsc::channel(4);
-        app.agents.write().unwrap().insert(id, Agent::new(1, tx));
+        app.agents.write().unwrap().insert(id, Agent::new(1, tx, false));
         (id, rx)
     }
 
@@ -685,7 +882,7 @@ mod tests {
 
         // The socket drops and the agent returns within the same minute.
         let (tx, _rx) = mpsc::channel(4);
-        app.agents.write().unwrap().insert(id, Agent::new(2, tx));
+        app.agents.write().unwrap().insert(id, Agent::new(2, tx, false));
         let loud = json!({"jsonrpc": "2.0", "method": "report",
                           "params": {"boot_id": "boot-a", "cpu": 99.0, "net_rx_total": 9_000,
                                      "net_tx_total": 4_500}})
@@ -818,7 +1015,7 @@ mod tests {
         // receiver changes nothing.
         let connect = |session| {
             let (tx, _) = mpsc::channel(1);
-            app.agents.write().unwrap().insert(id, Agent::new(session, tx));
+            app.agents.write().unwrap().insert(id, Agent::new(session, tx, false));
         };
 
         // The ordinary case: the session ending is the one on record.

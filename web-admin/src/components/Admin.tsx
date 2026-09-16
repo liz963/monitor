@@ -29,6 +29,11 @@ const TRAFFIC_MODES: Record<string, string> = {
   down: "仅下行",
 }
 
+// komari 的 token：8–128 位字母数字（komari 自己生成 22 位），与后端校验一致。
+function validKomariToken(token: string) {
+  return /^[A-Za-z0-9]{8,128}$/.test(token)
+}
+
 // Reordering uses the browser's view transitions, so displaced rows slide.
 // Browsers without support jump instead.
 function animate(update: () => void) {
@@ -106,16 +111,19 @@ function CreateNode({ onClose, onSaved }: {
   onSaved: () => void
 }) {
   const [name, setName] = useState("")
+  const [komari, setKomari] = useState("")
   const [saving, setSaving] = useState(false)
 
   async function save(e: React.FormEvent) {
     e.preventDefault()
     if (!name.trim()) return toast.error("请填写节点名称")
+    const komariToken = komari.trim()
+    if (komariToken && !validKomariToken(komariToken)) return toast.error("Komari Token 需为 8–128 位字母数字")
     setSaving(true)
     try {
       await api("/nodes", {
         method: "POST",
-        body: JSON.stringify({ name: name.trim() }),
+        body: JSON.stringify({ name: name.trim(), komari_token: komariToken }),
       })
       toast.success("节点已添加")
       onClose()
@@ -136,6 +144,9 @@ function CreateNode({ onClose, onSaved }: {
         <form className="space-y-4" onSubmit={save}>
           <Field label="名称">
             <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="香港 · 甲商家" />
+          </Field>
+          <Field label="Komari Token" hint="可选。留空则只使用 monitor 原生 Agent；填写后 VPS 上已有的 komari-agent 用此 token 直接接入，无需改动">
+            <Input value={komari} onChange={(e) => setKomari(e.target.value)} placeholder="22 位字母数字" />
           </Field>
           <DialogFooter className="border-t pt-4">
             <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
@@ -166,6 +177,8 @@ function NodeForm({ node, onClose, onSaved }: {
 
   async function save() {
     if (!form.name.trim()) return toast.error("请填写节点名称")
+    const komari = form.komari_token?.trim() ?? ""
+    if (komari && !validKomariToken(komari)) return toast.error("Komari Token 需为 8–128 位字母数字")
     const patch = changes(node, {
       name: form.name.trim(),
       public: form.public,
@@ -173,7 +186,7 @@ function NodeForm({ node, onClose, onSaved }: {
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
-      notify: !!form.notify,
+      komari_token: komari,
     })
     const correction = trafficCorrection(pristine.current, traffic)
     if ([patch.traffic_limit, ...Object.values(correction)].some((v) => v !== undefined && (!Number.isSafeInteger(v) || v < 0))) {
@@ -199,6 +212,16 @@ function NodeForm({ node, onClose, onSaved }: {
       toast.error((e as Error).message)
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function resetKomari() {
+    try {
+      const fresh = await api<{ komari_token: string }>(`/nodes/${node.id}/komari-token`, { method: "POST" })
+      set("komari_token", fresh.komari_token)
+      toast.success("Komari Token 已重置，旧 token 立即失效")
+    } catch (e) {
+      toast.error((e as Error).message)
     }
   }
 
@@ -251,6 +274,26 @@ function NodeForm({ node, onClose, onSaved }: {
                   />
                 </Field>
               ))}
+            </div>
+          </details>
+          <details className="rounded-lg border bg-muted/30 px-3 py-2.5">
+            <summary className="cursor-pointer text-sm font-medium">Komari 兼容</summary>
+            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+              为 VPS 上已有的 komari-agent 指定 token，agent 无需改动即可接入并上报。
+              留空表示禁用；填了之后该主机的 komari-agent 用此 token 连接。
+            </p>
+            <div className="mt-3 space-y-3">
+              <Field label="Komari Token" hint="与 monitor 原生 token 相互独立，互不影响">
+                <Input value={form.komari_token ?? ""} onChange={(e) => set("komari_token", e.target.value)} placeholder="22 位字母数字" />
+              </Field>
+              <div className="flex gap-2">
+                <Button type="button" variant="outline" size="sm" onClick={() => copy(form.komari_token ?? "")} disabled={!form.komari_token}>
+                  <Copy className="size-3.5" /> 复制
+                </Button>
+                <Button type="button" variant="outline" size="sm" onClick={resetKomari} disabled={!form.komari_token}>
+                  <RefreshCw className="size-3.5" /> 重置
+                </Button>
+              </div>
             </div>
           </details>
           <label className="flex cursor-pointer items-center justify-between gap-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-sm">
@@ -702,6 +745,16 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                         {n.country}
                       </Badge>
                     )}
+                    {n.agent_protocol === "komari" && (
+                      <Badge variant="outline" className="shrink-0 font-normal text-emerald-600">
+                        Komari
+                      </Badge>
+                    )}
+                    {n.agent_protocol === "native" && (
+                      <Badge variant="outline" className="shrink-0 font-normal text-sky-600">
+                        Native
+                      </Badge>
+                    )}
                   </div>
                 </TableCell>
                 {/* Addresses live only here, never on the public page. */}
@@ -749,17 +802,19 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 </TableCell>
               </TableRow>
             ))}
-            {nodes.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
-                  还没有节点，右上角添加
-                </TableCell>
-              </TableRow>
-            )}
+            {/* Only when the library is not empty: otherwise the two empty states
+                would stack, one for "no nodes" and one for "no match". */}
             {needle && nodes.length > 0 && !visible.length && (
               <TableRow>
                 <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
                   没有匹配的节点
+                </TableCell>
+              </TableRow>
+            )}
+            {nodes.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={7} className="py-10 text-center text-sm text-muted-foreground">
+                  还没有节点，右上角添加
                 </TableCell>
               </TableRow>
             )}

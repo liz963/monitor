@@ -61,8 +61,12 @@ export type Node = {
   remark?: string
   /** Panel only. Empty for nodes created before the hub retained a copy. */
   token?: string
-  /** Panel only. Whether going offline and returning are announced. */
-  notify?: boolean
+  /** Panel only. The komari-agent credential; empty when komari compatibility is off. */
+  komari_token?: string
+  /** Panel only. True when `komari_token` is set. */
+  komari_enabled?: boolean
+  /** Panel only. "komari" or "native": the protocol the node currently speaks. */
+  agent_protocol?: string
 }
 
 export type PingTask = { id: number; name: string; target: string; interval: number; nodes: number[] }

@@ -9,6 +9,7 @@ mod api;
 mod auth;
 mod db;
 mod frontend;
+mod komari_compat;
 mod notify;
 
 use std::collections::HashMap;
@@ -376,6 +377,10 @@ async fn main() -> Result<()> {
         // Agents.
         .route("/api/agent/ws", get(agent_ws::handler))
         .route("/api/agent/register", post(api::agent_register))
+        // komari-agents speak their own protocol on their own path; the two
+        // handlers below never see the native token, and the native one never
+        // sees komari's.
+        .route("/api/clients/v2/rpc", get(agent_ws::komari_ws_handler).post(agent_ws::komari_post_handler))
         .route("/install.sh", get(install_script))
         .route("/agent/{arch}", get(agent_binary))
         // Read paths; the public page reaches these unauthenticated.
@@ -394,6 +399,7 @@ async fn main() -> Result<()> {
         .route("/api/nodes/order", put(api::reorder_nodes))
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
+        .route("/api/nodes/{id}/komari-token", post(api::reset_komari_token))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/{id}", delete(api::delete_ping_task))

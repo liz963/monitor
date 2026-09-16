@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS node (
   -- The agent's credential, in the clear: the panel shows a node's install
   -- command whenever it is asked, so it has to be able to read it back.
   token         TEXT    NOT NULL UNIQUE,
+  -- The credential a komari-agent presents, kept apart from `token`: the
+  -- komari handler looks only at this column. NULL means "not set", so the
+  -- UNIQUE constraint does not collapse every node without one onto a value.
+  komari_token  TEXT    UNIQUE,
   sort          INTEGER NOT NULL DEFAULT 0,
   public        INTEGER NOT NULL DEFAULT 1,
   price         REAL    NOT NULL DEFAULT 0,
@@ -129,7 +133,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// Schema revision this build expects, stamped into `PRAGMA user_version`.
 /// Increment it and add a `migrate_to_N` when the schema changes under a
 /// database already in service.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -234,6 +238,15 @@ fn migrate_to_4(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "down_since INTEGER NOT NULL DEFAULT 0")
 }
 
+/// The credential a komari-agent presents, kept apart from the native token:
+/// the komari handler looks only at this column and the native handler only at
+/// `token`. Both are unique, and either may be empty. NULL rather than an empty
+/// string for "not set", so SQLite's UNIQUE constraint does not collapse every
+/// node without a komari token onto one value.
+fn migrate_to_5(conn: &Connection) -> Result<()> {
+    add_column(conn, "node", "komari_token TEXT UNIQUE")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -252,6 +265,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 4 {
         migrate_to_4(conn)?;
+    }
+    if from < 5 {
+        migrate_to_5(conn)?;
     }
     conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     Ok(())
@@ -331,6 +347,11 @@ pub struct Node {
     /// install command on demand; it never leaves the admin view.
     #[serde(default)]
     pub token: String,
+    /// The credential a komari-agent presents, kept apart from `token`: the
+    /// komari handler looks only at this column. Empty for a node that does not
+    /// speak komari.
+    #[serde(default)]
+    pub komari_token: String,
 }
 
 fn yes() -> bool {
@@ -352,6 +373,10 @@ pub struct NodePatch {
     pub traffic_limit: Option<i64>,
     pub traffic_mode: Option<String>,
     pub traffic_reset_day: Option<u32>,
+    /// `None` leaves the column alone; `Some(None)` clears it (disables komari
+    /// compatibility); `Some(Some(_))` sets it. Same shape as `expires_at`.
+    #[serde(default, deserialize_with = "expiry_patch")]
+    pub komari_token: Option<Option<String>>,
 }
 
 fn expiry_patch<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
@@ -527,8 +552,9 @@ impl Db {
             // A new node belongs at the end. The caller sends sort 0, which would
             // tie with whatever the last reorder placed first.
             "INSERT INTO node (name, token, sort, public, price, currency, billing_cycle,
-                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day, created_at)
-             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                               expires_at, remark, traffic_limit, traffic_mode, traffic_reset_day,
+                               komari_token, created_at)
+             VALUES (?1,?2,(SELECT COALESCE(MAX(sort),-1)+1 FROM node),?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 n.name,
                 token,
@@ -541,6 +567,9 @@ impl Db {
                 n.traffic_limit,
                 n.traffic_mode,
                 n.traffic_reset_day,
+                // An empty string means "no komari token"; NULL keeps the UNIQUE
+                // constraint from collapsing every such node onto one value.
+                (!n.komari_token.is_empty()).then_some(n.komari_token.as_str()),
                 Utc::now().timestamp()
             ],
         )?;
@@ -571,7 +600,8 @@ impl Db {
                              expires_at=CASE WHEN ?8 THEN ?9 ELSE expires_at END,
                              remark=COALESCE(?10,remark), traffic_limit=COALESCE(?11,traffic_limit),
                              traffic_mode=COALESCE(?12,traffic_mode),
-                             traffic_reset_day=COALESCE(?13,traffic_reset_day)
+                             traffic_reset_day=COALESCE(?13,traffic_reset_day),
+                             komari_token=CASE WHEN ?14 THEN ?15 ELSE komari_token END
              WHERE id=?1",
             params![
                 id,
@@ -586,7 +616,11 @@ impl Db {
                 n.remark,
                 n.traffic_limit,
                 n.traffic_mode,
-                n.traffic_reset_day
+                n.traffic_reset_day,
+                n.komari_token.is_some(),
+                // An explicit empty string clears the token; NULL is bound for
+                // "clear" (the CASE's ?15) exactly like an unset expiry date.
+                n.komari_token.as_ref().and_then(|v| v.as_deref()).filter(|s| !s.is_empty()),
             ],
         )?;
         Ok(())
@@ -636,6 +670,24 @@ impl Db {
 
     pub fn node_by_token(&self, token: &str) -> Result<Option<i64>> {
         Ok(self.conn().query_row("SELECT id FROM node WHERE token = ?1", [token], |r| r.get(0)).optional()?)
+    }
+
+    /// The node whose komari credential `token` names. The komari handler looks
+    /// only at this column; the native handler only at `token`.
+    pub fn find_host_by_komari_token(&self, token: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT id FROM node WHERE komari_token = ?1", [token], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Replaces a node's komari credential, which immediately locks out the old
+    /// one. An empty string clears it (the row goes back to NULL, so the UNIQUE
+    /// constraint still permits any number of cleared nodes).
+    pub fn set_komari_token(&self, id: i64, token: &str) -> Result<()> {
+        let value = (!token.is_empty()).then_some(token);
+        self.conn().execute("UPDATE node SET komari_token=?2 WHERE id=?1", params![id, value])?;
+        Ok(())
     }
 
     /// Stores the slow-changing facts an agent sends on connect, and reports
@@ -1545,6 +1597,7 @@ fn row_to_node(r: &rusqlite::Row<'_>) -> Node {
         country: s("country"),
         last_seen: n("last_seen"),
         token: s("token"),
+        komari_token: s("komari_token"),
     }
 }
 
