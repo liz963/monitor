@@ -234,6 +234,23 @@ fn default_hours() -> i64 {
 const HISTORY_SLOTS: usize = 4;
 static HISTORY_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HISTORY_SLOTS);
 
+/// Serialises the tests that share [`HISTORY_GATE`].
+///
+/// One gate per process is deliberate -- it bounds what one hub will do for
+/// anonymous callers, and a hub is a process -- but `cargo test` runs every test
+/// in threads of that same process. A test that holds all four permits and a
+/// test that asks for a window are then two halves of one scenario, and running
+/// them at once makes the holder's `try_acquire` panic while the asker is served
+/// a 503 it never asked for. Either failure reads as a bug in the gate, and
+/// which one appears depends on nothing but timing.
+///
+/// Taken by every test that touches the gate, in both directions. A `tokio`
+/// mutex rather than a `std` one: the guard is held across the `.await` of the
+/// request under test, which `clippy::await_holding_lock` rejects under
+/// `-D warnings`.
+#[cfg(test)]
+static GATE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn metrics(
     State(app): State<Shared>,
     headers: HeaderMap,
@@ -2482,6 +2499,9 @@ mod tests {
     /// that make this process work hard.
     #[tokio::test]
     async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
+        // Held to the end of the test: this one takes the whole gate, so nothing
+        // else in the process may be asking for a window meanwhile.
+        let _serial = GATE_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
         let ask = || {
@@ -2578,6 +2598,9 @@ mod tests {
     /// every row behind it holding the write connection.
     #[tokio::test]
     async fn an_anonymous_history_window_stops_at_a_week() {
+        // The other half of the pair above: this one needs a permit, and would
+        // be refused one while that test is holding all four.
+        let _serial = GATE_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
         let now = Utc::now().timestamp();
